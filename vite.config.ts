@@ -11,6 +11,8 @@ export default defineConfig(({ mode }) => {
     ? { "/v1": { target: env.QSB_API_ORIGIN, changeOrigin: true } }
     : undefined;
   return {
+    // Relative asset paths, so the build works under a GitHub Pages project path.
+    base: "./",
     plugins: [react()],
     resolve: {
       // The QSB SDK is built for Node. These are the only Node pieces it imports.

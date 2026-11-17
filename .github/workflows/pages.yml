@@ -1,0 +1,59 @@
+name: Publish to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  # The qsb-app commit the SDK is built from. Bump it deliberately.
+  QSB_APP_REF: 5a1d71209c6fce1c491110d2296994cbfd633c99
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: starknet-innovation/qsb-app
+          ref: ${{ env.QSB_APP_REF }}
+          path: .qsb-app
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build the QSB SDK
+        run: node scripts/vendor-sdk.mjs .qsb-app
+      - name: Install
+        # The SDK tarball is rebuilt here, so its lockfile hash is refreshed before the clean install.
+        run: |
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund ./vendor/starknet-innovation-qsb-sdk-0.0.0.tgz
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build
+        run: npm run build
+        env:
+          VITE_QSB_API: ${{ vars.VITE_QSB_API }}
+          VITE_LEDGER_PROVIDER: ${{ vars.VITE_LEDGER_PROVIDER }}
+          VITE_LEDGER_APP_NAME: ${{ vars.VITE_LEDGER_APP_NAME }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

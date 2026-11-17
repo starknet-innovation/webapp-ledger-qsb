@@ -28,6 +28,13 @@ npm run dev
 Add `?demo` to the address to walk through every screen with a simulated Ledger and service.
 Settings are in [.env.example](.env.example). WebHID needs Chrome, Edge or Brave on a computer.
 
+## Publish
+
+Every push to `main` builds and publishes to GitHub Pages
+([workflow](.github/workflows/pages.yml)). The build takes `VITE_QSB_API`, `VITE_LEDGER_PROVIDER`
+and `VITE_LEDGER_APP_NAME` from the repository's Actions variables. Pages is a different origin
+from the QSB service, so `VITE_QSB_API` must be set and the service must allow that origin.
+
 ## How it's built
 
 | Path | What it does |

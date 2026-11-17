@@ -1,0 +1,33 @@
+{
+  "name": "webapp-ledger-qsb",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "sdk": "node scripts/vendor-sdk.mjs",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@ledgerhq/device-management-kit": "^1.11.1",
+    "@ledgerhq/device-transport-kit-web-hid": "^1.2.4",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.0.0",
+    "@scure/base": "^2.4.0",
+    "@scure/btc-signer": "2.4.1",
+    "@starknet-innovation/qsb-sdk": "file:vendor/starknet-innovation-qsb-sdk-0.0.0.tgz",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "rxjs": "^7.8.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "typescript": "^5.9.0",
+    "vite": "^8.3.8"
+  }
+}

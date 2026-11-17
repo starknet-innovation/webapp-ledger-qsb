@@ -47,6 +47,7 @@ header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margi
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 28px 24px; }
 h1 { font-size: 28px; line-height: 1.2; margin: 0 0 12px; }
 p { margin: 0 0 16px; }
+.note { border-left: 4px solid var(--accent); padding: 4px 0 4px 12px; font-size: 16px; }
 .small { color: var(--muted); font-size: 15px; margin: 16px 0 0; }
 .amount { font-size: 32px; font-weight: 700; }
 a { color: inherit; }

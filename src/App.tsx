@@ -124,6 +124,12 @@ export function App() {
           <>
             <h1>Add the QSB app to your Ledger</h1>
             <p>It takes about a minute. Your other apps and your funds aren't touched.</p>
+            {config.install === "sideload" && (
+              <p className="note">
+                Your Ledger will say this app isn't verified by Ledger and ask you to allow it. That's expected: QSB is
+                research software that Ledger hasn't reviewed.
+              </p>
+            )}
             {progress === undefined ? (
               <button className="primary" onClick={install} disabled={action.busy}>
                 {action.busy ? "Opening QSB…" : "Install QSB app"}

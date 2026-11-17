@@ -10,6 +10,13 @@ export const config = {
   appName: import.meta.env.VITE_LEDGER_APP_NAME || "QSB",
   /** Ledger Manager provider that lists the app; unset means Ledger's public catalog. */
   provider: import.meta.env.VITE_LEDGER_PROVIDER ? Number(import.meta.env.VITE_LEDGER_PROVIDER) : undefined,
+  /**
+   * How the QSB app gets onto the Ledger: "catalog" (Ledger's servers, once Ledger lists the app)
+   * or "sideload" (this site's own build; the Ledger warns that Ledger hasn't verified it).
+   */
+  install: (import.meta.env.VITE_LEDGER_INSTALL || (import.meta.env.VITE_LEDGER_PROVIDER ? "catalog" : "sideload")) as
+    | "catalog"
+    | "sideload",
   /** Origin of the QSB service; defaults to the page's own origin. */
   api: import.meta.env.VITE_QSB_API || location.origin,
   path: "m/84'/0'/0'/0/0",

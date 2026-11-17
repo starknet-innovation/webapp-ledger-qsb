@@ -38,11 +38,17 @@ jobs:
         run: |
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund ./vendor/starknet-innovation-qsb-sdk-0.0.0.tgz
           npm ci --ignore-scripts --no-audit --no-fund
+      - name: Test
+        run: npm test
+      - name: Build the QSB Ledger app
+        # From the app-qsb commit and builder image pinned in the script, into public/firmware.
+        run: node scripts/build-firmware.mjs
       - name: Build
         run: npm run build
         env:
           VITE_QSB_API: ${{ vars.VITE_QSB_API }}
           VITE_LEDGER_PROVIDER: ${{ vars.VITE_LEDGER_PROVIDER }}
+          VITE_LEDGER_INSTALL: ${{ vars.VITE_LEDGER_INSTALL }}
           VITE_LEDGER_APP_NAME: ${{ vars.VITE_LEDGER_APP_NAME }}
       - uses: actions/upload-pages-artifact@v3
         with:

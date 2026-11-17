@@ -2,9 +2,10 @@
 
 A small web front end for QSB quantum-safe Bitcoin vaults that works only with a Ledger.
 Three steps, one decision per screen: connect the Ledger, install the QSB app on it, then
-deposit into a vault and later withdraw.
+deposit into a vault and later withdraw. The last step works only in the demo so far.
 
-"QSB" is the brand. New vaults use the PQB scheme (QSB v2); the name PQB never appears in the UI.
+"QSB" is the brand. Vaults use the PQB scheme (QSB v2). The Ledger app itself is named PQB, so the
+UI says so once, where the user has to recognise it on the device.
 
 **Research software, not audited. It targets Bitcoin mainnet.**
 
@@ -65,30 +66,38 @@ site installs it through Ledger's servers instead, with none of those warnings.
 | [src/App.tsx](src/App.tsx) | The three steps and the vault screens. |
 | [src/ledger/device.ts](src/ledger/device.ts) | Ledger Device Management Kit over WebHID: connect, install, `OpenAppDeviceAction`, raw APDUs. |
 | [src/ledger/sideload.ts](src/ledger/sideload.ts) | The loader that installs this site's own build of the QSB app. |
-| [src/ledger/qsbApp.ts](src/ledger/qsbApp.ts), [signer.ts](src/ledger/signer.ts) | Browser port of [app-qsb](https://github.com/starknet-innovation/app-qsb)'s `clients/js`: the Ledger as the SDK's `Signer`. |
-| [src/qsb/real.ts](src/qsb/real.ts) | Deposits and withdrawals through the QSB SDK's `QsbClient`; sign-in is a BIP-322 challenge approved on the Ledger. |
-| [src/qsb/custody.ts](src/qsb/custody.ts) | Where vault secrets live: on the Ledger, or nowhere. |
+| [src/ledger/pqbApp.ts](src/ledger/pqbApp.ts) | The read-only commands of [app-qsb](https://github.com/starknet-innovation/app-qsb) this site uses: version and vault count. |
+| [src/qsb/real.ts](src/qsb/real.ts) | Deposits and withdrawals through the QSB SDK's `QsbClient`. Not reachable today (see below). |
+| [src/qsb/custody.ts](src/qsb/custody.ts) | The SDK's custody and journal hooks. Not reachable today. |
 | [src/qsb/demo.ts](src/qsb/demo.ts) | The simulated Ledger and service behind `?demo`. |
 
-## What has to exist before this works with a real Ledger
+## What works and what doesn't
 
-Tested so far: typecheck, production build, the loader's unit tests (`npm test`), and the whole
-flow in `?demo`. Not tested with a
-Ledger or against a QSB service. Three things are open:
+Tested: typecheck, production build, the loader's unit tests (`npm test`), and the whole flow in
+`?demo`. Nothing has run on a physical Ledger.
 
-1. **Installing the app is untested on hardware.** app-qsb isn't in Ledger's catalog, so by
-   default the site loads its own build onto the Ledger (see [Installing the QSB app](#installing-the-qsb-app)).
-   The loader passes its tests against Ledger's Python tool, but no physical device has run it.
-2. **The QSB Ledger app must support v2 (PQB) vaults.** app-qsb 0.1.0 only recognises v1
-   (Config A) vault scripts, so it refuses to sign a v2 deposit, and it has no commands to derive
-   v2 vault material or authorize a v2 withdrawal. This front end never creates or holds a vault
-   seed in the browser, so "create vault" stops with a plain message until the app gains those
-   commands; they plug into `src/qsb/custody.ts`.
-3. **The QSB service must accept this origin.** The published site points at a service that
-   serves v2 (`VITE_QSB_API`), but its CORS doesn't allow the Pages origin, so the browser blocks
-   every call. Allow the origin on the service, or serve this front end from the service's own
-   origin (in development set `QSB_API_ORIGIN`). The sign-in challenge names the service's origin.
+With a real Ledger the site connects, installs the app, opens it and reads its version and vault
+count. It stops there: **deposits and withdrawals only work in `?demo`**. The reason is a mismatch
+between the Ledger app and the QSB service, which this repository can't settle:
 
-Also open: the SDK's one-time journal is kept in this browser's `localStorage`, which is not the
-durable, shared store the SDK asks for; and the withdrawal is approved on the Ledger's screen
-only (the SDK's `approve` callback accepts the transaction the Ledger signed).
+| | Ledger app (app-qsb 0.2.0, "PQB") | QSB SDK and service (qsb-app) |
+| --- | --- | --- |
+| Sign-in | No sign-in command | A BIP-322 signature from the wallet address opens every session |
+| Deposit | Each vault has its own deposit address; the device signs one sweep from it into the vault | The wallet address pays the vault, with change back to the wallet |
+| Withdrawal | One input, the vault output; the device builds the transaction itself | Two inputs: a helper input from the wallet, then the vault |
+| Puzzle search | Exports menu points for pqb's solver | Its own coordinator and public problem format |
+
+So [src/qsb/real.ts](src/qsb/real.ts) and [src/qsb/custody.ts](src/qsb/custody.ts), written against
+the SDK, are kept but not reachable: nothing can implement the SDK's `Signer` on this app. A vault
+flow for this app needs, outside this repository: a way to send the deposit sweep to a miner (the
+vault output is a bare 4,696-byte script, which ordinary nodes don't relay), and a solver that
+produces one-input withdrawals for the device to authorize.
+
+Also open:
+
+- **Installing is untested on hardware** (see [Installing the QSB app](#installing-the-qsb-app)).
+- **An app update erases the app's records on the Ledger.** app-qsb's README says this ends its
+  custody guarantee for every vault of that seed and leaves only its emergency path. Reinstalling
+  from this page is an app update.
+- **The QSB service's CORS** allows the Pages origin in qsb-app's source since `5874874`; whether
+  the deployed service has it was not re-checked.

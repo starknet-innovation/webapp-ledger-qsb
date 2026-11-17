@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { config } from "./env";
 import { connectLedger, ledgerSupported, type Device } from "./ledger/device";
+import type { AppStatus } from "./ledger/pqbApp";
 import { btc, parseBtc, type Backend, type Snapshot } from "./qsb/backend";
 import { demoBackend, demoDevice } from "./qsb/demo";
 
@@ -54,16 +55,15 @@ export function App() {
   const [step, setStep] = useState<Step>("connect");
   const [device, setDevice] = useState<Device>();
   const [backend, setBackend] = useState<Backend>();
+  const [status, setStatus] = useState<AppStatus>();
   const action = useAction();
   const [progress, setProgress] = useState<number>();
 
   const openVault = async (d: Device, say: (hint: string) => void) => {
     if (!(await d.openApp(say))) return setStep("install");
+    // Only the demo has a working vault flow today; see "What has to exist" in the README.
     if (config.demo) setBackend(demoBackend());
-    else {
-      const { realBackend } = await import("./qsb/real");
-      setBackend(realBackend(await d.signer()));
-    }
+    else setStatus(await d.status());
     setStep("vault");
   };
 
@@ -126,13 +126,14 @@ export function App() {
             <p>It takes about a minute. Your other apps and your funds aren't touched.</p>
             {config.install === "sideload" && (
               <p className="note">
-                Your Ledger will say this app isn't verified by Ledger and ask you to allow it. That's expected: QSB is
-                research software that Ledger hasn't reviewed.
+                Your Ledger will say this app isn't verified by Ledger and ask you to allow it. That's expected: it is
+                research software that Ledger hasn't reviewed. On your Ledger the app is called{" "}
+                <strong>{config.appName}</strong>.
               </p>
             )}
             {progress === undefined ? (
               <button className="primary" onClick={install} disabled={action.busy}>
-                {action.busy ? "Opening QSB…" : "Install QSB app"}
+                {action.busy ? "Opening the app…" : "Install QSB app"}
               </button>
             ) : (
               <div className="progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress * 100)}>
@@ -146,6 +147,22 @@ export function App() {
         )}
 
         {step === "vault" && backend && <Vault backend={backend} />}
+        {step === "vault" && !backend && status && (
+          <>
+            <h1>Your Ledger is ready</h1>
+            <p>
+              The app is installed and working (version {status.version}).{" "}
+              {status.vaults === 0
+                ? "This Ledger has no vault yet."
+                : `This Ledger holds ${status.vaults} vault${status.vaults === 1 ? "" : "s"}.`}
+            </p>
+            <p className="note">
+              You can't deposit or withdraw from this page yet. That part is still being built. Don't send bitcoin to
+              a vault from here.
+            </p>
+            <p className="small">Nothing on your Ledger changed apart from the new app.</p>
+          </>
+        )}
       </section>
 
       <footer>

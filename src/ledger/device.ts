@@ -13,24 +13,23 @@ import {
 import { webHidIdentifier, webHidTransportFactory } from "@ledgerhq/device-transport-kit-web-hid";
 import { firstValueFrom } from "rxjs";
 import { config } from "../env";
-import { QsbApp } from "./qsbApp";
+import { PqbApp, type AppStatus } from "./pqbApp";
 import { LoaderError, parseScript, sideload, type Send } from "./sideload";
-import { LedgerQsbSigner, type WalletSigner } from "./signer";
 
 /** Tells the user what to do on the device right now; "" clears it. */
 export type Say = (hint: string) => void;
 
 export interface Device {
   readonly name: string;
-  /** Opens the QSB app. False when it isn't installed. */
+  /** Opens the app. False when it isn't installed. */
   openApp(say: Say): Promise<boolean>;
   /**
    * Installs the QSB app: from Ledger's catalog when `config.install` is "catalog", otherwise by
    * loading the build this site serves. `progress` goes from 0 to 1.
    */
   install(progress: (fraction: number) => void, say: Say): Promise<void>;
-  /** The wallet inside the QSB app. The app must be open. */
-  signer(): Promise<WalletSigner>;
+  /** What the open app says about itself. The app must be open. */
+  status(): Promise<AppStatus>;
   disconnect(): Promise<void>;
 }
 
@@ -51,7 +50,7 @@ function dmk() {
 const hints: Partial<Record<UserInteractionRequired, string>> = {
   [UserInteractionRequired.UnlockDevice]: "Unlock your Ledger.",
   [UserInteractionRequired.AllowSecureConnection]: "On your Ledger, allow Ledger Manager.",
-  [UserInteractionRequired.ConfirmOpenApp]: "On your Ledger, confirm opening QSB.",
+  [UserInteractionRequired.ConfirmOpenApp]: `On your Ledger, confirm opening ${config.appName}.`,
 };
 
 const text = (error: unknown) => {
@@ -139,7 +138,7 @@ export async function connectLedger(): Promise<Device> {
     const r = await sdk.sendApdu({ sessionId, apdu });
     return { sw: (r.statusCode[0] << 8) | r.statusCode[1], data: r.data };
   };
-  const app = new QsbApp(send);
+  const app = new PqbApp(send);
 
   /** Loads the QSB build served next to this page, for apps Ledger's catalog doesn't carry. */
   const loadFromSite = async (progress: (fraction: number) => void, say: Say) => {
@@ -199,8 +198,12 @@ export async function connectLedger(): Promise<Device> {
         );
       }
     },
-    async signer() {
-      return LedgerQsbSigner.connect(app, config.path);
+    async status() {
+      try {
+        return await app.status();
+      } catch {
+        throw new Plain("The app on your Ledger is out of date. Install it again from this page.");
+      }
     },
     async disconnect() {
       await sdk.disconnect({ sessionId }).catch(() => {});

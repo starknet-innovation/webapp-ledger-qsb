@@ -111,7 +111,7 @@ test("the handshake and load deliver the builder's commands to the device unchan
   await sideload(device.send, 0x33100004, script, (f) => seen.push(f));
   assert.deepEqual(device.received.map(hex), text.trim().split("\n").map((line) => line.slice(10)));
   assert.equal(seen.at(-1), 1);
-  assert.equal(hex(script[0]), "0c03515342"); // delete "QSB"
+  assert.equal(hex(script[0]), "0c03505142"); // delete any installed "PQB" first
   assert.equal(script[1][0], 0x0b); // create app
   assert.equal(hex(script.at(-1)!), "09"); // commit
 });

@@ -24,8 +24,8 @@ export const demoDevice: Device = {
     }
     installed = true;
   },
-  async signer() {
-    throw new Error("The demo has no wallet.");
+  async status() {
+    return { version: "0.2.0", profile: "PQB-v1", vaults: 0 };
   },
   async disconnect() {},
 };

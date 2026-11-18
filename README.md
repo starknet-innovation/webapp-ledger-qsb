@@ -100,7 +100,9 @@ that secret or those machines.
 ## What works and what doesn't
 
 Tested: typecheck, production build, the loader's unit tests (`npm test`), the Speculos test
-below, and the whole flow in `?demo`. Nothing has run on a physical Ledger.
+below, and the whole flow in `?demo`. On a physical Nano S Plus (18 November 2026), the published
+site connected, sideloaded PQB 0.2.0 (app-qsb `59538d9`), opened it and read its status. Stax,
+Flex and Apex P have only run on Speculos.
 
 With a real Ledger the site connects, installs the app, opens it and reads its version and vault
 count. It stops there: **deposits and withdrawals only work in `?demo`**. The reason is a mismatch
@@ -121,7 +123,8 @@ produces one-input withdrawals for the device to authorize.
 
 Also open:
 
-- **Installing is untested on hardware** (see [Installing the QSB app](#installing-the-qsb-app)).
+- **Installing is tested on one Nano S Plus only** (see [Installing the QSB app](#installing-the-qsb-app)).
+  Stax, Flex and Apex P, and other OS versions, haven't been tried on hardware.
 - **An app update erases the app's records on the Ledger.** After that the device has no history
   for the seed and only its emergency withdrawal path remains. Reinstalling from this page is an
   app update.

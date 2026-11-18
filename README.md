@@ -96,8 +96,12 @@ produces one-input withdrawals for the device to authorize.
 Also open:
 
 - **Installing is untested on hardware** (see [Installing the QSB app](#installing-the-qsb-app)).
-- **An app update erases the app's records on the Ledger.** app-qsb's README says this ends its
-  custody guarantee for every vault of that seed and leaves only its emergency path. Reinstalling
-  from this page is an app update.
+- **An app update erases the app's records on the Ledger.** After that the device has no history
+  for the seed and only its emergency withdrawal path remains. Reinstalling from this page is an
+  app update.
+- **Custody conformance needs a host this site doesn't have.** Since `59538d9` app-qsb claims only
+  derivation compatibility with the BIP draft 0.2.0; the rest (vault directory and journal, chain
+  checks before allocating and withdrawing, restoration) is the host's job, and no client
+  implements it yet.
 - **The QSB service's CORS** allows the Pages origin in qsb-app's source since `5874874`; whether
   the deployed service has it was not re-checked.

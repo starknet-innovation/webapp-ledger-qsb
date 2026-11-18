@@ -1,7 +1,7 @@
 // The read-only part of the PQB Ledger app's protocol that this front end uses today.
 // Protocol: https://github.com/starknet-innovation/app-qsb/blob/main/docs/apdu.md
 // The full client (vault creation, deposit signing, withdrawals) is app-qsb's clients/js.
-import type { Send } from "./sideload";
+import type { Send } from "./sideload.ts";
 
 const CLA = 0xe0;
 const INS = { GET_VERSION: 0x03, GET_STATE: 0x14 } as const;
@@ -10,8 +10,10 @@ const SW_OK = 0x9000;
 const SW_NOT_ACCEPTED = 0x6901;
 
 export class PqbStatusError extends Error {
-  constructor(readonly statusWord: number) {
+  readonly statusWord: number;
+  constructor(statusWord: number) {
     super(`The app on your Ledger refused the request (0x${statusWord.toString(16).padStart(4, "0")}).`);
+    this.statusWord = statusWord;
   }
 }
 
@@ -25,7 +27,10 @@ export type AppStatus = {
 };
 
 export class PqbApp {
-  constructor(private readonly send: Send) {}
+  private readonly send: Send;
+  constructor(send: Send) {
+    this.send = send;
+  }
 
   private async exchange(ins: number, p1: number, data: Uint8Array = new Uint8Array()): Promise<Uint8Array> {
     const apdu = new Uint8Array(5 + data.length);

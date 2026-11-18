@@ -43,6 +43,12 @@ jobs:
       - name: Build the QSB Ledger app
         # From the app-qsb commit and builder image pinned in the script, into public/firmware.
         run: node scripts/build-firmware.mjs
+      - name: Test the app on Speculos
+        # Every device model, with the repository's own test seed (never Speculos's public default).
+        # Publishing stops here if the SPECULOS_SEED secret isn't set.
+        run: npm run test:speculos
+        env:
+          SPECULOS_SEED: ${{ secrets.SPECULOS_SEED }}
       - name: Build
         run: npm run build
         env:

@@ -1,6 +1,7 @@
 // Builds the QSB Ledger app (github.com/starknet-innovation/app-qsb) for every device that can
 // take a sideloaded app, with Ledger's builder image, and writes the install files the web app
-// serves: public/firmware/<device>.apdu and public/firmware/manifest.json. Needs Docker.
+// serves: public/firmware/<device>.apdu and public/firmware/manifest.json. It also keeps each
+// device binary in build/firmware/<device>.elf, unpublished, for the Speculos test. Needs Docker.
 // Usage: npm run firmware            (clones app-qsb at APP_QSB_REF)
 //        npm run firmware -- <path>  (uses an existing checkout as it is)
 import { execFileSync } from "node:child_process";
@@ -20,6 +21,7 @@ const DEVICES = { nanosplus: "Nano S Plus", stax: "Stax", flex: "Flex", apex_p: 
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const out = path.join(root, "public", "firmware");
+const binaries = path.join(root, "build", "firmware");
 const git = (cwd, ...args) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
 let checkout = process.argv[2] && path.resolve(process.argv[2]);
@@ -35,8 +37,10 @@ const version = /^version\s*=\s*"([^"]+)"/m.exec(readFileSync(path.join(checkout
 if (!crate || !version) throw new Error("Couldn't read the crate name and version from app/Cargo.toml.");
 const dirty = git(checkout, "status", "--porcelain", "--untracked-files=no") !== "";
 
-rmSync(out, { recursive: true, force: true });
-mkdirSync(out, { recursive: true });
+for (const dir of [out, binaries]) {
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+}
 const manifest = { source: "https://github.com/starknet-innovation/app-qsb", commit, dirty, builder: BUILDER, devices: {} };
 
 for (const [device, label] of Object.entries(DEVICES)) {
@@ -50,6 +54,7 @@ for (const [device, label] of Object.entries(DEVICES)) {
   if (!info) throw new Error(`Couldn't read the build's app infos for ${device}:\n${log.slice(-2000)}`);
   const release = path.join(checkout, "app", "target", device, "release");
   const name = `${crate}.apdu`;
+  writeFileSync(path.join(binaries, `${device}.elf`), readFileSync(path.join(release, crate)));
   const script = readFileSync(path.join(release, name));
   writeFileSync(path.join(out, `${device}.apdu`), script);
   /** The app's name on the device: what the Ledger shows and what opens it. */

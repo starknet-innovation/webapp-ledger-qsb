@@ -59,12 +59,38 @@ Ledger's current documentation; Apex P support is likewise assumed, not confirme
 Once Ledger lists the app, set `VITE_LEDGER_INSTALL=catalog` (or `VITE_LEDGER_PROVIDER`) and the
 site installs it through Ledger's servers instead, with none of those warnings.
 
+## Speculos test
+
+`npm run test:speculos` starts Ledger's emulator, Speculos, with the app this site installs, once
+for each of Nano S Plus, Stax, Flex and Apex P. On each it runs the site's own device session
+([src/ledger/session.ts](src/ledger/session.ts)) over Ledger's Speculos transport: it opens the app,
+checks its version and profile against the manifest, and checks that a missing app is reported as
+missing. It needs Docker and `npm run firmware` first.
+
+```bash
+SPECULOS_SEED="word1 … word24" npm run test:speculos
+```
+
+It runs on every publish, with the seed from the repository secret `SPECULOS_SEED`; without that
+secret, publishing stops. The runner refuses Speculos's public default seed, passes the seed to
+Docker by name rather than on a command line, and masks it in any log it prints. The test itself
+never sees the seed.
+
+What it doesn't cover: installing (Speculos runs the app binary directly, not through the Ledger's
+loader), the Ledger's screens, and anything on chain. The site has no vault flow for the real app
+yet, so there is nothing to run on mainnet.
+
+**Keep the seed a test seed.** It lives in a GitHub secret and on the machines that run this test.
+Anything sent on mainnet to an address or vault derived from it is exposed to everyone who can read
+that secret or those machines.
+
 ## How it's built
 
 | Path | What it does |
 | --- | --- |
 | [src/App.tsx](src/App.tsx) | The three steps and the vault screens. |
-| [src/ledger/device.ts](src/ledger/device.ts) | Ledger Device Management Kit over WebHID: connect, install, `OpenAppDeviceAction`, raw APDUs. |
+| [src/ledger/device.ts](src/ledger/device.ts) | Ledger Device Management Kit over WebHID, with this site's settings. |
+| [src/ledger/session.ts](src/ledger/session.ts) | One connected Ledger on any transport: open the app, install it, read its status. |
 | [src/ledger/sideload.ts](src/ledger/sideload.ts) | The loader that installs this site's own build of the QSB app. |
 | [src/ledger/pqbApp.ts](src/ledger/pqbApp.ts) | The read-only commands of [app-qsb](https://github.com/starknet-innovation/app-qsb) this site uses: version and vault count. |
 | [src/qsb/real.ts](src/qsb/real.ts) | Deposits and withdrawals through the QSB SDK's `QsbClient`. Not reachable today (see below). |
@@ -73,8 +99,8 @@ site installs it through Ledger's servers instead, with none of those warnings.
 
 ## What works and what doesn't
 
-Tested: typecheck, production build, the loader's unit tests (`npm test`), and the whole flow in
-`?demo`. Nothing has run on a physical Ledger.
+Tested: typecheck, production build, the loader's unit tests (`npm test`), the Speculos test
+below, and the whole flow in `?demo`. Nothing has run on a physical Ledger.
 
 With a real Ledger the site connects, installs the app, opens it and reads its version and vault
 count. It stops there: **deposits and withdrawals only work in `?demo`**. The reason is a mismatch

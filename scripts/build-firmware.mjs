@@ -12,7 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** The app-qsb commit that gets installed on users' devices. Bump it deliberately. */
-const APP_QSB_REF = "59538d93310fda4f3d262d0e423596cbbe76e412";
+const APP_QSB_REF = "ae20b4151739125e7ceda6e80f8cca0850bb26bd";
 /** Ledger's builder image, by digest, so the same sources give the same toolchain. */
 const BUILDER =
   "ghcr.io/ledgerhq/ledger-app-builder/ledger-app-dev-tools@sha256:96fff93c04aa73e97588e1616d4162bed7c12b643b429e4c34ec90494a81695b";

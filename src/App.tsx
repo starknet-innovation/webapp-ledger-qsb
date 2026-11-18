@@ -63,7 +63,12 @@ export function App() {
     if (!(await d.openApp(say))) return setStep("install");
     // Only the demo has a working vault flow today; see "What has to exist" in the README.
     if (config.demo) setBackend(demoBackend());
-    else setStatus(await d.status());
+    else {
+      const current = await d.status();
+      setStatus(current);
+      // An app from before sign-in reports the same version; replace it.
+      if (!current.signIn) return setStep("install");
+    }
     setStep("vault");
   };
 
@@ -122,8 +127,14 @@ export function App() {
 
         {step === "install" && (
           <>
-            <h1>Add the QSB app to your Ledger</h1>
+            <h1>{status ? "Update the QSB app on your Ledger" : "Add the QSB app to your Ledger"}</h1>
             <p>It takes about a minute. Your other apps and your funds aren't touched.</p>
+            {status && status.vaults > 0 && (
+              <p className="error">
+                Updating erases the app's record of your {status.vaults} vault{status.vaults === 1 ? "" : "s"}. Withdraw
+                from them first, or ask for help before you update.
+              </p>
+            )}
             {config.install === "sideload" && (
               <p className="note">
                 Your Ledger will say this app isn't verified by Ledger and ask you to allow it. That's expected: it is

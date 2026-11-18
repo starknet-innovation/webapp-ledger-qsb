@@ -10,7 +10,7 @@ import {
   isSuccessCommandResult,
   type DeviceManagementKit,
 } from "@ledgerhq/device-management-kit";
-import { PqbApp, type AppStatus } from "./pqbApp.ts";
+import { PqbApp, PqbStatusError, SW_UNKNOWN_INS, type AppStatus } from "./pqbApp.ts";
 import { LoaderError, parseScript, sideload, type Send } from "./sideload.ts";
 
 /** Tells the user what to do on the device right now; "" clears it. */
@@ -27,6 +27,13 @@ export interface Device {
   install(progress: (fraction: number) => void, say: Say): Promise<void>;
   /** What the open app says about itself. The app must be open. */
   status(): Promise<AppStatus>;
+  /** Vault `v`'s deposit address. Read-only, no approval. The app must be open. */
+  depositAddress(v: number): Promise<{ address: string }>;
+  /**
+   * Signs the QSB service's sign-in challenge as vault `v`'s deposit address, after the user
+   * approves it on the Ledger. Returns the address and the BIP-322 signature. The app must be open.
+   */
+  signIn(v: number, message: string, say: Say): Promise<{ address: string; signature: string }>;
   disconnect(): Promise<void>;
 }
 
@@ -180,6 +187,26 @@ export function openSession(sdk: DeviceManagementKit, sessionId: string, options
         return await app.status();
       } catch {
         throw new Plain("The app on your Ledger is out of date. Install it again from this page.");
+      }
+    },
+    async depositAddress(v) {
+      return { address: (await app.depositAddress(v)).address };
+    },
+    async signIn(v, message, say) {
+      // The kit polls the device in the background; keep it quiet while the review is on screen.
+      const resume = sdk.disableDeviceSessionRefresher({ sessionId, blockerId: "qsb-sign-in" });
+      say("Check the details on your Ledger, then approve the sign-in.");
+      try {
+        return await app.signIn(v, message);
+      } catch (error) {
+        if (error instanceof PqbStatusError && error.statusWord === SW_UNKNOWN_INS)
+          throw new Plain("The app on your Ledger is out of date. Install it again from this page.");
+        if (error instanceof PqbStatusError && error.statusWord === 0x6985)
+          throw new Plain("You declined on your Ledger. Try again when you're ready.");
+        throw error;
+      } finally {
+        say("");
+        resume();
       }
     },
     async disconnect() {

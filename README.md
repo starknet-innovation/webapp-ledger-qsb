@@ -63,9 +63,18 @@ site installs it through Ledger's servers instead, with none of those warnings.
 
 `npm run test:speculos` starts Ledger's emulator, Speculos, with the app this site installs, once
 for each of Nano S Plus, Stax, Flex and Apex P. On each it runs the site's own device session
-([src/ledger/session.ts](src/ledger/session.ts)) over Ledger's Speculos transport: it opens the app,
-checks its version and profile against the manifest, and checks that a missing app is reported as
-missing. It needs Docker and `npm run firmware` first.
+([src/ledger/session.ts](src/ledger/session.ts)) over Ledger's Speculos transport. It checks that:
+
+- the app opens and reports the manifest's version and profile, and that it has the sign-in command;
+- the app refuses to sign anything but the QSB sign-in challenge for its own deposit address;
+- on Nano S Plus, a sign-in approved on the device verifies with the verifier qsb-app's server uses
+  (`bip322-js` 4.0.0, strict), and a declined one is reported as declined. The test approves by
+  reading the screen and pressing buttons through Speculos's API; the touch models skip these two;
+- a missing app is reported as missing.
+
+With `QSB_API` set it also signs in to that QSB service for real, on Nano S Plus (vault 0's deposit
+address gets a session; nothing else happens). Not run on publish. It needs Docker and
+`npm run firmware` first.
 
 ```bash
 SPECULOS_SEED="word1 … word24" npm run test:speculos
@@ -77,7 +86,7 @@ Docker by name rather than on a command line, and masks it in any log it prints.
 never sees the seed.
 
 What it doesn't cover: installing (Speculos runs the app binary directly, not through the Ledger's
-loader), the Ledger's screens, and anything on chain. The site has no vault flow for the real app
+loader), approvals on the touch models, and anything on chain. The site has no vault flow for the real app
 yet, so there is nothing to run on mainnet.
 
 **Keep the seed a test seed.** It lives in a GitHub secret and on the machines that run this test.
@@ -110,16 +119,16 @@ between the Ledger app and the QSB service, which this repository can't settle:
 
 | | Ledger app (app-qsb 0.2.0, "PQB") | QSB SDK and service (qsb-app) |
 | --- | --- | --- |
-| Sign-in | No sign-in command | A BIP-322 signature from the wallet address opens every session |
+| Sign-in | SIGN_IN (since `5542722`): a BIP-322 signature as a vault's deposit address | A BIP-322 signature from the wallet address opens every session |
 | Deposit | Each vault has its own deposit address; the device signs one sweep from it into the vault | The wallet address pays the vault, with change back to the wallet |
 | Withdrawal | One input, the vault output; the device builds the transaction itself | Two inputs: a helper input from the wallet, then the vault |
 | Puzzle search | Exports menu points for pqb's solver | Its own coordinator and public problem format |
 
-So [src/qsb/real.ts](src/qsb/real.ts) and [src/qsb/custody.ts](src/qsb/custody.ts), written against
-the SDK, are kept but not reachable: nothing can implement the SDK's `Signer` on this app. A vault
-flow for this app needs, outside this repository: a way to send the deposit sweep to a miner (the
-vault output is a bare 4,696-byte script, which ordinary nodes don't relay), and a solver that
-produces one-input withdrawals for the device to authorize.
+Sign-in now lines up: with SIGN_IN the vault's deposit address can be the SDK's wallet, and the PQB
+app signs the deposit sweep when it has no change. The withdrawal doesn't: qsb-app solves a two-input
+transaction and the device authorizes only a one-input one, and a solution for one can't be used for
+the other. So [src/qsb/real.ts](src/qsb/real.ts) and [src/qsb/custody.ts](src/qsb/custody.ts) stay
+unreachable, and the site doesn't take deposits: a deposit made now could not be withdrawn.
 
 Also open:
 

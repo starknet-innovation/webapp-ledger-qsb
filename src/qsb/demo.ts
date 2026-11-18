@@ -25,7 +25,13 @@ export const demoDevice: Device = {
     installed = true;
   },
   async status() {
-    return { version: "0.2.0", profile: "PQB-v1", vaults: 0 };
+    return { version: "0.2.0", profile: "PQB-v1", vaults: 0, signIn: true };
+  },
+  async depositAddress() {
+    return { address: "bc1qdemo0000000000000000000000000000000demo" };
+  },
+  async signIn() {
+    throw new Error("The demo doesn't sign in.");
   },
   async disconnect() {},
 };

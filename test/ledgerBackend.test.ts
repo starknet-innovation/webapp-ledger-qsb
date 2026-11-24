@@ -306,6 +306,7 @@ test("a withdrawal is quoted above MARA's floor: max(2 × floor, floor + 2 sat/v
 const { ledgerBackend, canonicalIntent, intentKey, reclaimProblem, withdrawalVsizeFor } = await import("../src/qsb/ledgerBackend.ts");
 const { hex } = await import("@scure/base");
 
+const BROADCAST_URL = "https://broadcast.test/api/tx";
 const VAULT_ID = "11111111-1111-4111-8111-111111111111";
 const JOB_ID = "22222222-2222-4222-8222-222222222222";
 const SCRIPT_HASH = new Uint8Array(32).fill(0xab);
@@ -357,6 +358,10 @@ function flow(setup: {
   rates?: { submit_fee_rate: number; market_rate?: number };
   utxos?: { txid: string; vout: number; value: string }[];
   status?: Record<string, unknown>;
+  /** Previous transactions the service returns for /payment-input, by txid. */
+  previous?: Map<string, Uint8Array>;
+  /** The broadcast endpoint's answer to a raw transaction. */
+  broadcast?: (rawHex: string) => Response;
 }) {
   const { map, storage } = memoryStorage();
   const log: string[] = [];
@@ -374,12 +379,26 @@ function flow(setup: {
     sweepInput: new Uint8Array(36),
     disclosure: null,
   };
+  const refundCalls: { v: number; unsigned: Uint8Array; previous: Uint8Array[] }[] = [];
+  const broadcasts: string[] = [];
   const app = {
     async getRecords() {
       return [record];
     },
     async getDepositAddress() {
       return deposit;
+    },
+    // A Ledger holding the deposit key: real BIP-143 signatures over the streamed transaction.
+    async signRefund(v: number, unsigned: Uint8Array, previous: Uint8Array[]) {
+      refundCalls.push({ v, unsigned, previous });
+      const tx = Transaction.fromRaw(unsigned, opts);
+      for (let i = 0; i < tx.inputsLength; i++) {
+        const input = tx.getInput(i);
+        const prev = previous.map((raw) => Transaction.fromRaw(raw, opts)).find((p) => p.id === hex.encode(input.txid!))!;
+        tx.updateInput(i, { witnessUtxo: prev.getOutput(input.index!) as { script: Uint8Array; amount: bigint } });
+        tx.signIdx(key, i);
+      }
+      return Array.from({ length: tx.inputsLength }, (_, i) => tx.getInput(i).partialSig![0][1]);
     },
   };
   const device = {
@@ -395,7 +414,18 @@ function flow(setup: {
       return { address: deposit.address, signature: "sig" };
     },
   };
-  const fetch = (async (url: string) => {
+  const fetch = (async (url: string, init?: RequestInit) => {
+    if (String(url) === BROADCAST_URL) {
+      broadcasts.push(String(init?.body));
+      return setup.broadcast ? setup.broadcast(String(init?.body)) : new Response(Transaction.fromRaw(hex.decode(String(init?.body)), opts).id);
+    }
+    if (String(url).endsWith("/payment-input")) {
+      const headers = init?.headers as Record<string, string>;
+      assert.equal(headers["X-Qsb-Authorization"], `Bearer ${"t".repeat(43)}`);
+      const point = JSON.parse(String(init?.body));
+      const raw = setup.previous?.get(point.txid);
+      return raw ? new Response(JSON.stringify({ previousTxHex: hex.encode(raw) })) : new Response("{}", { status: 404 });
+    }
     const body = String(url).endsWith("/auth/challenge") ? { id: "c", message: "sign me" } : { token: "t".repeat(43) };
     return new Response(JSON.stringify(body), { status: 200 });
   }) as unknown as typeof globalThis.fetch;
@@ -406,6 +436,7 @@ function flow(setup: {
   const job = setup.job === null || setup.job === undefined ? undefined : { id: JOB_ID, vaultId: VAULT_ID, createdAt: "2026-11-01T00:00:00Z", ...setup.job };
   const backend = ledgerBackend(device as never, {
     api: "https://qsb.test",
+    broadcastUrl: BROADCAST_URL,
     storage,
     fetch,
     persist: () => void persisted++,
@@ -467,7 +498,7 @@ function flow(setup: {
     },
   });
   const journalKey = `qsb-journal:${intentKey(hex.encode(SCRIPT_HASH))}`;
-  return { backend, map, log, hints, journalKey, signIns: () => signIns, persisted: () => persisted };
+  return { backend, map, log, hints, journalKey, refundCalls, broadcasts, signIns: () => signIns, persisted: () => persisted };
 }
 const quiet = () => {};
 const withdrawHint = "Check the withdrawal on your Ledger, then approve.";
@@ -627,4 +658,193 @@ test("M6: bitcoin left at the deposit address after the deposit is shown", async
   assert.equal((await f.backend.snapshot(quiet)).vault!.leftoverSats, 12_000n);
   const none = flow({ job: null });
   assert.equal((await none.backend.snapshot(quiet)).vault!.leftoverSats, undefined);
+});
+
+// ---- Refunds. ----
+
+const { refundVsize, refundQuote, refundableUtxos, refundScript, verifyRefund } = await import("../src/qsb/ledgerBackend.ts");
+const { p2tr, p2pkh, Address, OutScript } = await import("@scure/btc-signer");
+const P2TR_DESTINATION = p2tr(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true).subarray(1), undefined, NETWORK).address!;
+
+test("a refund's vsize and fee: P2WPKH inputs, one output sized by the destination", () => {
+  // n = 1 to P2WPKH (22-byte script): base = 4 + 1 + 41 + 1 + 8 + 1 + 22 + 4 = 82, witness = 2 + 108.
+  assert.equal(refundVsize(1, 22), Math.ceil((82 * 4 + 110) / 4));
+  assert.equal(refundVsize(1, 22), 110);
+  // To P2TR (34-byte script): 12 bytes more.
+  assert.equal(refundVsize(1, 34), 122);
+  // Three inputs to P2TR: base = 4 + 1 + 123 + 1 + 8 + 1 + 34 + 4 = 176, witness = 2 + 324.
+  assert.equal(refundVsize(3, 34), Math.ceil((176 * 4 + 326) / 4));
+  assert.deepEqual(refundQuote([40_000n, 60_000n], 22, 2_500n), { total: 100_000n, fee: 445n, vsize: 178, amount: 99_555n });
+  // n = 2 to P2WPKH: base = 4 + 1 + 82 + 1 + 8 + 1 + 22 + 4 = 123, witness = 2 + 216: ceil(710 / 4) = 178; 178 × 2.5 = 445.
+
+  // An upper bound on a real signed refund, within a byte per input.
+  for (const [n, to] of [[1, DESTINATION], [3, P2TR_DESTINATION], [8, DESTINATION]] as const) {
+    const tx = new Transaction(opts);
+    for (let i = 0; i < n; i++)
+      tx.addInput({ txid: sha256(Uint8Array.of(i)), index: 0, witnessUtxo: { amount: 10_000n, script: p2wpkh(publicKey, NETWORK).script } });
+    tx.addOutputAddress(to, 1_000n, NETWORK);
+    for (let i = 0; i < n; i++) tx.signIdx(key, i);
+    tx.finalize();
+    const scriptLength = tx.getOutput(0).script!.length;
+    assert.ok(tx.vsize <= refundVsize(n, scriptLength), `${n} inputs`);
+    assert.ok(refundVsize(n, scriptLength) - tx.vsize <= n);
+  }
+});
+
+test("a refund goes only to another valid mainnet address", () => {
+  const own = { depositScript: p2wpkh(publicKey, NETWORK).script, vaultScript: new Uint8Array(SCRIPT_LEN).fill(0x51) };
+  assert.equal(refundScript(DESTINATION, own).length, 22);
+  assert.equal(refundScript(P2TR_DESTINATION, own).length, 34);
+  assert.throws(() => refundScript(deposit.address, own), /own address/);
+  for (const bad of ["", "bc1qnotanaddress", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "1BoatSLRHtKNngkdXEeobR76b53LETtpyX"])
+    assert.throws(() => refundScript(bad, own), Plain, bad);
+});
+
+test("what's refundable leaves out a pending deposit's inputs, and keeps the 8 largest", () => {
+  const utxos = Array.from({ length: 10 }, (_, i) => ({ txid: hex.encode(sha256(Uint8Array.of(i))), vout: i % 2, value: String((i + 1) * 1000) }));
+  const picked = refundableUtxos(utxos, [{ txid: utxos[9].txid.toUpperCase(), vout: 1 }]);
+  assert.equal(picked.length, 8);
+  assert.ok(!picked.includes(utxos[9]), "the reserved output is left out");
+  assert.deepEqual(picked.map((u) => u.value), ["9000", "8000", "7000", "6000", "5000", "4000", "3000", "2000"]);
+});
+
+/** Outputs at the deposit address, with the previous transactions the service holds for them. */
+function depositOutputs(values: bigint[]) {
+  const previous = new Map<string, Uint8Array>();
+  const utxos = values.map((value, i) => {
+    const prev = previousTx(value, 100 + i);
+    previous.set(prev.id, prev.toBytes(true, true));
+    return { txid: prev.id, vout: 0, value: value.toString() };
+  });
+  return { utxos, previous };
+}
+
+/** A signed deposit spending `inputs`, as the SDK keeps it. */
+function pendingDepositSpending(inputs: { txid: string; vout: number }[]) {
+  const tx = new Transaction({ ...opts, version: 2 });
+  for (const i of inputs) tx.addInput({ txid: i.txid, index: i.vout });
+  tx.addOutput({ amount: 1_000n, script: new Uint8Array(SCRIPT_LEN).fill(0x51) });
+  return JSON.stringify({ txid: tx.id, amount: "1000", rawTxHex: hex.encode(tx.unsignedTx) });
+}
+
+test("nothing is refundable while a deposit is pending; a pending deposit's inputs are never refunded", async () => {
+  const { utxos, previous } = depositOutputs([200_000n, 50_000n]);
+  const depositing = flow({ vault: { status: "unfunded", funding: undefined }, record: { funding: null }, utxos, previous });
+  depositing.map.set(`qsb-pending:${VAULT_ID}`, pendingDepositSpending([utxos[0]]));
+  const view = (await depositing.backend.snapshot(quiet)).vault!;
+  assert.equal(view.step, "depositing");
+  assert.equal(view.refundableSats, undefined);
+  depositing.map.set(`qsb-pending:${VAULT_ID}`, pendingDepositSpending([utxos[0]]));
+  await assert.rejects(depositing.backend.refund(DESTINATION, quiet), /deposit is on its way/);
+  assert.equal(depositing.refundCalls.length, 0);
+
+  // A funded vault whose browser still holds the old deposit: its input stays out of a refund.
+  const funded = flow({ job: null, utxos, previous });
+  funded.map.set(`qsb-pending:${VAULT_ID}`, pendingDepositSpending([utxos[0]]));
+  assert.equal((await funded.backend.snapshot(quiet)).vault!.refundableSats, 50_000n);
+  await funded.backend.refund(DESTINATION, quiet);
+  assert.deepEqual(Transaction.fromRaw(funded.refundCalls[0].unsigned, opts).getInput(0).txid, hex.decode(utxos[1].txid));
+
+  // Before funding, with no deposit pending, everything there can go back.
+  const unfunded = flow({ vault: { status: "unfunded", funding: undefined }, record: { funding: null }, utxos, previous });
+  const ready = (await unfunded.backend.snapshot(quiet)).vault!;
+  assert.equal(ready.refundableSats, 250_000n);
+  // Dust after the fee: not offered.
+  const dust = flow({ job: null, ...depositOutputs([700n]) });
+  assert.equal((await dust.backend.snapshot(quiet)).vault!.refundableSats, undefined);
+  await assert.rejects(dust.backend.refund(DESTINATION, quiet), /too little/);
+});
+
+test("a refund to the deposit address or a bad address never reaches the Ledger", async () => {
+  const f = flow({ job: null, ...depositOutputs([100_000n]) });
+  await assert.rejects(f.backend.refund(deposit.address, quiet), /own address/);
+  await assert.rejects(f.backend.refund("bc1qnope", quiet), /isn't a Bitcoin address/);
+  assert.equal(f.refundCalls.length, 0);
+  assert.equal(f.broadcasts.length, 0);
+});
+
+test("a refund is signed on the Ledger, verified, broadcast, and shown until it confirms", async () => {
+  const { utxos, previous } = depositOutputs([30_000n, 80_000n]);
+  const f = flow({ job: null, utxos, previous, rates: { submit_fee_rate: 1, market_rate: 3.5 } });
+  const { txid } = await f.backend.refund(P2TR_DESTINATION, quiet);
+  assert.ok(f.hints.includes("Check the address and amount on your Ledger, then approve."));
+  assert.equal(f.refundCalls.length, 1);
+  assert.equal(f.broadcasts.length, 1);
+
+  const tx = Transaction.fromRaw(hex.decode(f.broadcasts[0]), opts);
+  assert.equal(tx.id, txid);
+  assert.equal(tx.version, 2);
+  assert.equal(tx.lockTime, 0);
+  assert.equal(tx.inputsLength, 2);
+  assert.equal(tx.outputsLength, 1);
+  // Largest first; fee at the market rate (3.5 sat/vB) on the P2TR estimate.
+  const fee = (BigInt(refundVsize(2, 34)) * 3_500n + 999n) / 1000n;
+  assert.equal(tx.getOutput(0).amount, 110_000n - fee);
+  assert.equal(hex.encode(tx.getOutput(0).script!), hex.encode(OutScript.encode(Address(NETWORK).decode(P2TR_DESTINATION))));
+  for (let i = 0; i < 2; i++) {
+    const input = tx.getInput(i);
+    assert.equal(input.sequence, 0xfffffffd);
+    const [signature, witnessKey] = input.finalScriptWitness!;
+    assert.deepEqual(witnessKey, publicKey);
+    const amount = BigInt(utxos.find((u) => u.txid === hex.encode(input.txid!))!.value);
+    // BIP-143 over the P2PKH scriptCode, SIGHASH_ALL.
+    const digest = tx.preimageWitnessV0(i, p2pkh(publicKey, NETWORK).script, 1, amount);
+    assert.ok(secp256k1.verify(signature.subarray(0, -1), digest, publicKey, { prehash: false, format: "der" }), `input ${i}`);
+  }
+  assert.ok(f.map.has(`qsb-refund:${deposit.address}`), "kept in localStorage");
+
+  // Until it confirms, the snapshot shows it and nothing else is refundable or waiting.
+  const view = (await f.backend.snapshot(quiet)).vault!;
+  assert.equal(view.refundTxid, txid);
+  assert.equal(view.refundableSats, undefined);
+  assert.equal(view.leftoverSats, undefined);
+  await assert.rejects(f.backend.refund(P2TR_DESTINATION, quiet), /already sent back/);
+
+  // Confirmed: its inputs left the deposit address, and it's forgotten.
+  utxos.length = 0;
+  const after = (await f.backend.snapshot(quiet)).vault!;
+  assert.equal(after.refundTxid, undefined);
+  assert.ok(!f.map.has(`qsb-refund:${deposit.address}`));
+});
+
+test("a failed broadcast is retried with the same bytes, without asking the Ledger again", async () => {
+  let fail = true;
+  const { utxos, previous } = depositOutputs([100_000n]);
+  const f = flow({
+    job: null,
+    utxos,
+    previous,
+    broadcast: (raw) => (fail ? new Response("Service Unavailable", { status: 503 }) : new Response(Transaction.fromRaw(hex.decode(raw), opts).id)),
+  });
+  await assert.rejects(f.backend.refund(DESTINATION, quiet), (e: Error) => e instanceof Plain && /same transaction is resent/.test(e.message) && !!e.cause);
+  assert.equal((await f.backend.snapshot(quiet)).vault!.refundTxid, undefined, "not shown as sent");
+  await assert.rejects(f.backend.refund(P2TR_DESTINATION, quiet), /already approved sending it back to/);
+  fail = false;
+  const { txid } = await f.backend.refund(DESTINATION, quiet);
+  assert.equal(f.refundCalls.length, 1, "one Ledger approval");
+  assert.equal(f.broadcasts.length, 2);
+  assert.equal(f.broadcasts[1], f.broadcasts[0], "identical bytes");
+  assert.equal((await f.backend.snapshot(quiet)).vault!.refundTxid, txid);
+});
+
+test("a broadcast that answers another txid is refused", async () => {
+  const f = flow({ job: null, ...depositOutputs([100_000n]), broadcast: () => new Response("ab".repeat(32)) });
+  await assert.rejects(f.backend.refund(DESTINATION, quiet), /different transaction/);
+  assert.equal((await f.backend.snapshot(quiet)).vault!.refundTxid, undefined);
+});
+
+test("verifyRefund refuses a signature by another key", () => {
+  const tx = new Transaction(opts);
+  tx.addInput({ txid: sha256(Uint8Array.of(1)), index: 0, witnessUtxo: { amount: 10_000n, script: p2wpkh(publicKey, NETWORK).script } });
+  tx.addOutputAddress(DESTINATION, 9_000n, NETWORK);
+  const signed = Transaction.fromRaw(tx.unsignedTx, opts);
+  signed.updateInput(0, { witnessUtxo: { amount: 10_000n, script: p2wpkh(publicKey, NETWORK).script } });
+  signed.signIdx(key, 0);
+  const good = signed.getInput(0).partialSig![0][1];
+  verifyRefund(tx, publicKey, [good]);
+  const other = secp256k1.utils.randomSecretKey();
+  const forged = Transaction.fromRaw(tx.unsignedTx, opts);
+  forged.updateInput(0, { witnessUtxo: { amount: 10_000n, script: p2wpkh(secp256k1.getPublicKey(other, true), NETWORK).script } });
+  forged.signIdx(other, 0);
+  assert.throws(() => verifyRefund(tx, publicKey, [forged.getInput(0).partialSig![0][1]]), /doesn't verify/);
 });

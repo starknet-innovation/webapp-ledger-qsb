@@ -74,6 +74,9 @@ form .error { margin: 0 0 12px; }
 .mono button { flex: none; }
 .meta { font-size: 13px; overflow-wrap: anywhere; }
 .secondary + .hint, .secondary + .error { margin-top: 12px; }
+.aside { margin: 20px 0 0; padding-top: 16px; border-top: 1px solid var(--line); }
+.aside .note { margin-bottom: 12px; }
+.link { display: block; margin: 12px auto 0; padding: 8px; border: 0; background: transparent; color: var(--muted); font-size: 16px; text-decoration: underline; }
 
 .progress { position: relative; height: 56px; border-radius: 12px; border: 1px solid var(--line); overflow: hidden; }
 .progress div { height: 100%; background: var(--accent); opacity: 0.35; transition: width 0.2s; }

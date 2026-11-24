@@ -22,6 +22,11 @@ export const config = {
    * until a one-input PQB withdrawal has been solved and spent on mainnet, a deposit may not come back.
    */
   vaultFlow: import.meta.env.VITE_VAULT_FLOW === "on",
+  /**
+   * Where a refund from a deposit address is broadcast (POST, the raw transaction as hex text). The
+   * QSB service relays vault deposits only. Default: mempool.space's public API.
+   */
+  broadcastUrl: import.meta.env.VITE_BROADCAST_URL || "https://mempool.space/api/tx",
   /** Origin of the QSB service; defaults to the page's own origin. */
   api: import.meta.env.VITE_QSB_API || location.origin,
 };

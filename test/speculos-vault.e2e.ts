@@ -1,5 +1,6 @@
 // End-to-end against Speculos for a vault held on the Ledger: allocate, read it the way the site
-// does, export the solver data, sign a sweep into it, then disclose for a withdrawal and retry.
+// does, export the solver data, sign a sweep into it, sign refunds from its deposit address, then
+// disclose for a withdrawal and retry.
 //
 // DISPOSABLE SEEDS ONLY. These tests create a vault, sign a sweep and disclose its one-time
 // secrets (WITHDRAW). The emulator's record of that disclosure is thrown away with the container,
@@ -16,7 +17,7 @@ import { DeviceManagementKitBuilder, DeviceModelId, type DeviceManagementKit } f
 import { speculosIdentifier, speculosTransportFactory } from "@ledgerhq/device-transport-kit-speculos";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { p2wpkh } from "@scure/btc-signer";
+import { p2tr, p2wpkh } from "@scure/btc-signer";
 import { firstValueFrom, timeout } from "rxjs";
 import { assembleDisclosed, descriptorFor, readDeviceVault, type DeviceVault } from "../src/qsb/deviceVault.ts";
 import { openSession, type Device } from "../src/ledger/session.ts";
@@ -102,6 +103,10 @@ const SCREENS = {
   create: [/Create PQB vault/, /^Create$/],
   exportPoints: [/Export solver data/, /^Export$/],
   sweep: [/Review transaction/, /^Sign transaction/],
+  // "Review transaction / to refund a PQB deposit", then From, Amount/To (or Change) per output, Fees.
+  refund: [/refund a PQB/, /^Sign transaction/],
+  // The page after "Sign transaction": both buttons on it reject.
+  refundReject: [/refund a PQB/, /^Reject/],
   withdraw: [/Withdraw from/, /^Disclose$/],
   // An action page with one button ("Back"): both buttons as soon as it shows.
   conflict: [/already/, /already/],
@@ -256,6 +261,113 @@ test("SIGN_DEPOSIT: a sweep into the vault, approved, verifies under the deposit
   const [record] = await records();
   assert.equal(hex(record.funding!.txid), hex(txidInternal(raw)));
   assert.equal(record.funding!.value, sweep.value);
+});
+
+// ---- Refunds from the deposit address (SIGN_DEPOSIT kind 0x02), allowed in any vault state -----
+
+/** A synthetic previous transaction paying `amount` to `script`, from an outpoint that never existed. */
+const payment = (tag: number, amount: bigint, script: Uint8Array) =>
+  serializeTx({
+    version: 2,
+    inputs: [{ txid: sha256(Uint8Array.of(0x52, v, tag)), vout: 0, scriptSig: new Uint8Array(), sequence: 0xfffffffd }],
+    outputs: [{ amount, script }],
+    lockTime: 0,
+  });
+/** An unsigned refund spending output 0 of each of `prevs`. */
+const refundOf = (prevs: Uint8Array[], outputs: TxOutput[]) => ({
+  version: 2,
+  inputs: prevs.map((prev) => ({ txid: txidInternal(prev), vout: 0, scriptSig: new Uint8Array(), sequence: 0xfffffffd })),
+  outputs,
+  lockTime: 0,
+});
+/** Each signature is DER || SIGHASH_ALL over the BIP-143 digest of its input, under the deposit key. */
+function verifyRefund(tx: ReturnType<typeof refundOf>, values: bigint[], signatures: Uint8Array[]) {
+  assert.equal(signatures.length, values.length);
+  for (const [i, signature] of signatures.entries()) {
+    assert.equal(signature.at(-1), 0x01, "SIGHASH_ALL");
+    const digest = bip143(tx, i, deposit.publicKey, values[i]);
+    assert.ok(secp256k1.verify(signature.subarray(0, -1), digest, deposit.publicKey, { format: "der", prehash: false, lowS: true }), `input ${i}`);
+  }
+}
+/**
+ * The review's text, line breaks and separators dropped: an address wraps across lines, and a long
+ * one across pages titled "To (1/2)", "To (2/2)", whose titles are dropped too.
+ */
+const flat = (screens: string[]) => screens.join("").replace(/[\s|]/g, "").replace(/To\(\d+\/\d+\)/g, "");
+// Destinations from fixed throwaway keys (no one needs to spend them: nothing is broadcast).
+const P2TR_TO = p2tr(secp256k1.getPublicKey(sha256(Uint8Array.of(0x74, 0x72)), true).subarray(1));
+const P2WPKH_TO = p2wpkh(secp256k1.getPublicKey(sha256(Uint8Array.of(0x77, 0x70)), true));
+
+test("SIGN_DEPOSIT refund of a funded vault's later payments: reviewed, approved, verifies", async () => {
+  assert.equal((await run((app) => app.getVault(v))).funded, true, "the sweep recorded the funding");
+  const values = [30_000n, 15_000n];
+  const prevs = values.map((value, i) => payment(i, value, p2wpkhScript(deposit.publicKey)));
+  const sent = 44_000n; // fee 1,000
+  const tx = refundOf(prevs, [{ amount: sent, script: P2TR_TO.script }]);
+  const [signatures, screens] = await Promise.all([run((app) => app.signRefund(v, serializeTx(tx), prevs)), on("refund")]);
+  verifyRefund(tx, values, signatures);
+  // Not over other amounts: the device proved them from the previous transactions.
+  assert.ok(!secp256k1.verify(signatures[1].subarray(0, -1), bip143(tx, 1, deposit.publicKey, values[0]), deposit.publicKey, { format: "der", prehash: false }));
+
+  const text = flat(screens);
+  assert.match(P2TR_TO.address!, /^bc1p/);
+  assert.ok(text.includes(P2TR_TO.address!), `the review shows the destination ${P2TR_TO.address}: ${screens.join(" / ")}`);
+  assert.ok(text.includes("0.00044BTC"), "the review shows the amount sent");
+  assert.ok(text.includes("0.00001BTC"), "the review shows the fee");
+  assert.ok(text.includes(`Depositofvault#${v}`), "the review names the deposit it spends from");
+  assert.ok(!text.includes("Change"), "no change output");
+
+  // A refund records nothing: the funding stays the sweep's.
+  const [record] = await records();
+  assert.equal(record.state, "allocated");
+  assert.equal(hex(record.funding!.txid), hex(txidInternal(sweep.raw)));
+});
+
+test("SIGN_DEPOSIT refund with change back to the deposit address: approved, verifies", async () => {
+  const values = [25_000n];
+  const prevs = values.map((value, i) => payment(0x10 + i, value, p2wpkhScript(deposit.publicKey)));
+  const tx = refundOf(prevs, [
+    { amount: 12_000n, script: P2WPKH_TO.script },
+    { amount: 12_500n, script: p2wpkhScript(deposit.publicKey) }, // change; fee 500
+  ]);
+  const [signatures, screens] = await Promise.all([run((app) => app.signRefund(v, serializeTx(tx), prevs)), on("refund")]);
+  verifyRefund(tx, values, signatures);
+  const text = flat(screens);
+  assert.ok(text.includes(P2WPKH_TO.address!), `the review shows the destination ${P2WPKH_TO.address}: ${screens.join(" / ")}`);
+  assert.ok(text.includes("0.00012BTC"), "the amount sent");
+  assert.ok(text.includes("Change0.000125BTC"), "the change, shown as change");
+  assert.ok(!text.includes(deposit.address), "the change isn't shown as a payee address");
+});
+
+test("SIGN_DEPOSIT refund refusals: a foreign input, an output with no address", async () => {
+  const isStatus = (word: number) => (e: unknown) => e instanceof PqbStatusError && e.statusWord === word;
+  // An input paying another address: refused while streaming, before any review.
+  const own = payment(0x20, 20_000n, p2wpkhScript(deposit.publicKey));
+  const foreign = payment(0x21, 20_000n, P2WPKH_TO.script);
+  const mixed = refundOf([own, foreign], [{ amount: 39_000n, script: P2TR_TO.script }]);
+  await assert.rejects(run((app) => app.signRefund(v, serializeTx(mixed), [own, foreign])), isStatus(STATUS.NOT_DEPOSIT_ADDRESS));
+  // OP_RETURN, and a bare script: refused at REVIEW, before anything is shown.
+  for (const script of [Uint8Array.of(0x6a, 0x01, 0x00), Uint8Array.of(0x51)]) {
+    const tx = refundOf([own], [{ amount: 10_000n, script: P2TR_TO.script }, { amount: 9_000n, script }]);
+    await assert.rejects(run((app) => app.signRefund(v, serializeTx(tx), [own])), isStatus(STATUS.OUTPUT_NOT_ADDRESS));
+  }
+  // Only back to the deposit address: nothing leaves it.
+  const loop = refundOf([own], [{ amount: 19_000n, script: p2wpkhScript(deposit.publicKey) }]);
+  await assert.rejects(run((app) => app.signRefund(v, serializeTx(loop), [own])), isStatus(STATUS.UNSUPPORTED_LAYOUT));
+});
+
+test("SIGN_DEPOSIT refund declined on the device: 0x6985", async () => {
+  const prev = payment(0x30, 18_000n, p2wpkhScript(deposit.publicKey));
+  const tx = refundOf([prev], [{ amount: 17_000n, script: P2TR_TO.script }]);
+  // The device's own status word, caught inside the session (which turns 0x6985 into a Plain
+  // "You declined on your Ledger" for the site).
+  const [refused] = await Promise.all([
+    run((app) => app.signRefund(v, serializeTx(tx), [prev]).then(() => assert.fail("signed after a decline"), (e: unknown) => e)),
+    on("refundReject"),
+  ]);
+  assert.ok(refused instanceof PqbStatusError && refused.statusWord === STATUS.REJECTED, String(refused));
+  // The device is usable afterwards.
+  assert.equal((await run((app) => app.getVault(v))).funded, true);
 });
 
 // The withdrawal: any valid selection and picks. Nothing is solved, so the script won't accept it.

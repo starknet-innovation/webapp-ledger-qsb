@@ -28,9 +28,10 @@ import {
   type SignedWithdrawal,
   type WithdrawalSigningRequest,
 } from "@starknet-innovation/qsb-sdk";
+import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { base64, hex } from "@scure/base";
-import { Address, NETWORK, OutScript, RawTx, Transaction } from "@scure/btc-signer";
+import { Address, NETWORK, OutScript, RawTx, SigHash, Transaction, p2pkh, p2wpkh } from "@scure/btc-signer";
 import { Plain, type Device, type PqbApp, type Say } from "../ledger/session";
 import { fingerprint, SCRIPT_LEN } from "../vendor/pqb-ledger/pqb";
 import type { VaultRecord } from "../vendor/pqb-ledger/pqb";
@@ -43,6 +44,7 @@ const HINT = {
   deposit: "Check the deposit on your Ledger, then approve.",
   withdraw: "Check the withdrawal on your Ledger, then approve.",
   address: "Compare the address on your Ledger with this page, then confirm.",
+  refund: "Check the address and amount on your Ledger, then approve.",
   read: "",
 };
 
@@ -158,6 +160,127 @@ export function intentRate(manifest: { fee: string; outputScript: string }): big
 export function feeRateText(milliSatPerVb: bigint): string {
   const fraction = (milliSatPerVb % 1000n).toString().padStart(3, "0").replace(/0+$/, "");
   return `${milliSatPerVb / 1000n}${fraction ? `.${fraction}` : ""}`;
+}
+
+// ---- Refunds: bitcoin at the deposit address sent back out, never into the vault. ----
+
+/** Output script types the Ledger pays in a refund (app-qsb docs/apdu.md, SIGN_DEPOSIT kind 0x02). */
+const REFUND_TYPES = new Set(["pkh", "sh", "wpkh", "wsh", "tr"]);
+
+/**
+ * A refund's size in vB: every input a P2WPKH spend from the deposit address (72-byte DER maximum),
+ * one output with a `outputScriptLength`-byte script, no change.
+ */
+export function refundVsize(inputCount: number, outputScriptLength: number): number {
+  if (!Number.isSafeInteger(inputCount) || inputCount < 1) throw new Error("A refund has at least one input.");
+  const base = 4 + varintSize(inputCount) + 41 * inputCount + varintSize(1) + 8 + varintSize(outputScriptLength) + outputScriptLength + 4;
+  const witness = 2 + inputCount * (1 + 1 + 72 + 1 + 33);
+  return Math.ceil((base * 4 + witness) / 4);
+}
+
+/** Everything in `values`, less the fee at `milliSatPerVb` (rounded up), as one output. */
+export function refundQuote(values: bigint[], outputScriptLength: number, milliSatPerVb: bigint) {
+  const vsize = refundVsize(values.length, outputScriptLength);
+  const fee = (BigInt(vsize) * milliSatPerVb + 999n) / 1000n;
+  const total = values.reduce((sum, value) => sum + value, 0n);
+  return { total, fee, vsize, amount: total - fee };
+}
+
+/** The longest script a refund may pay (P2WSH, P2TR): what `refundableSats` is quoted for. */
+const LONGEST_REFUND_SCRIPT = 34;
+
+/**
+ * The refund's output script for `destination` (a mainnet address the Ledger can pay), refusing
+ * the vault's own deposit address and its script.
+ */
+export function refundScript(destination: string, own: { depositScript: Uint8Array; vaultScript?: Uint8Array }): Uint8Array {
+  let script: Uint8Array;
+  try {
+    const decoded = Address(NETWORK).decode(destination);
+    if (!REFUND_TYPES.has(decoded.type)) throw new Error(`unsupported ${decoded.type}`);
+    script = OutScript.encode(decoded);
+  } catch (cause) {
+    throw new Plain("That isn't a Bitcoin address your Ledger can send to. Check it and try again.", { cause });
+  }
+  const same = (a: Uint8Array, b?: Uint8Array) => !!b && a.length === b.length && a.every((x, i) => x === b[i]);
+  if (same(script, own.depositScript) || same(script, own.vaultScript))
+    throw new Plain("That's this vault's own address. Send it back to another address.");
+  return script;
+}
+
+type Outpoint = { txid: string; vout: number };
+const pointKey = (p: Outpoint) => `${p.txid.toLowerCase()}:${p.vout}`;
+
+/** The outpoints a raw transaction spends, as the service writes them (txid in display order). */
+export function spentBy(rawTxHex: string): Outpoint[] {
+  const tx = Transaction.fromRaw(hex.decode(rawTxHex), { allowUnknownInputs: true, allowUnknownOutputs: true, disableScriptCheck: true });
+  return Array.from({ length: tx.inputsLength }, (_, i) => {
+    const input = tx.getInput(i);
+    return { txid: hex.encode(input.txid!), vout: input.index! };
+  });
+}
+
+/**
+ * What a refund may spend: the largest MAX_SWEEP_INPUTS outputs at the deposit address, leaving
+ * out those a pending deposit, a withdrawal's helper or an already-sent refund spends.
+ */
+export function refundableUtxos<T extends Outpoint & { value: string }>(utxos: T[], reserved: Outpoint[]): T[] {
+  const taken = new Set(reserved.map(pointKey));
+  return [...utxos]
+    .filter((u) => !taken.has(pointKey(u)))
+    .sort((a, b) => (BigInt(b.value) > BigInt(a.value) ? 1 : BigInt(b.value) < BigInt(a.value) ? -1 : 0))
+    .slice(0, MAX_SWEEP_INPUTS);
+}
+
+/** A signed refund, kept until its inputs leave the deposit address so a retry resends these bytes. */
+export type SignedRefund = { txid: string; hex: string; destination: string; inputs: Outpoint[]; amount: string; broadcast: boolean };
+
+/** Signed refunds by deposit address, in localStorage (`qsb-refund:<address>`) with a copy in memory. */
+export function localRefunds(storage: () => KeyValue | undefined = browserStorage) {
+  const key = (address: string) => `qsb-refund:${address}`;
+  const memory = new Map<string, SignedRefund>();
+  return {
+    get(address: string): SignedRefund | undefined {
+      try {
+        const raw = storage()?.getItem(key(address));
+        if (raw) return JSON.parse(raw) as SignedRefund;
+      } catch {
+        // Fall back to this page's copy.
+      }
+      return memory.get(address);
+    },
+    set(address: string, refund: SignedRefund) {
+      memory.set(address, refund);
+      try {
+        storage()?.setItem(key(address), JSON.stringify(refund));
+      } catch {
+        // Kept in memory for this page.
+      }
+    },
+    delete(address: string) {
+      memory.delete(address);
+      try {
+        storage()?.removeItem(key(address));
+      } catch {
+        // Nothing to do.
+      }
+    },
+  };
+}
+
+/** Throws unless every input's signature is a valid BIP-143 SIGHASH_ALL signature by `publicKey`. */
+export function verifyRefund(tx: Transaction, publicKey: Uint8Array, signatures: Uint8Array[]) {
+  // BIP-143: a P2WPKH input's scriptCode is the P2PKH script of its key.
+  const scriptCode = p2pkh(publicKey, NETWORK).script;
+  if (signatures.length !== tx.inputsLength) throw new Error("The Ledger returned the wrong number of signatures.");
+  signatures.forEach((signature, i) => {
+    if (signature.at(-1) !== SigHash.ALL) throw new Error("The Ledger signed with an unexpected sighash type.");
+    const amount = tx.getInput(i).witnessUtxo?.amount;
+    if (amount === undefined) throw new Error("A refund input is missing its amount.");
+    const digest = tx.preimageWitnessV0(i, scriptCode, SigHash.ALL, amount);
+    if (!secp256k1.verify(signature.subarray(0, -1), digest, publicKey, { prehash: false, format: "der" }))
+      throw new Error(`The Ledger's signature for input ${i} doesn't verify.`);
+  });
 }
 
 // ---- What the screens show. ----
@@ -562,6 +685,8 @@ export type LedgerBackendOptions = {
   persist?: () => void;
   /** Clock, in ms (tests). */
   now?: () => number;
+  /** Where a refund is broadcast (POST, raw hex as text); defaults to config.broadcastUrl. */
+  broadcastUrl?: string;
 };
 
 /** A submitted withdrawal's status is checked at most this often (the webapp's own pace, docs/API.md). */
@@ -586,10 +711,15 @@ export function ledgerBackend(device: Device, options: LedgerBackendOptions = {}
   /** The miner's refusal of a vault's last deposit, by vault, until a deposit goes through. */
   const rejected = new Map<string, string>();
   const makeClient = options.client ?? ((o: QsbClientOptions) => new QsbClient(o));
+  /** Signed refunds by deposit address: a retry resends these bytes; dropped once their inputs are spent. */
+  const refunds = localRefunds(options.storage);
 
   const fetcher: typeof fetch = (input, init) => (options.fetch ?? globalThis.fetch)(input, { ...init, redirect: "error" });
   let api: Promise<string> | undefined;
   const origin = () => (api ??= options.api !== undefined ? Promise.resolve(options.api) : import("../env").then((m) => m.config.api));
+  let broadcastTo: Promise<string> | undefined;
+  const broadcastUrl = () =>
+    (broadcastTo ??= options.broadcastUrl !== undefined ? Promise.resolve(options.broadcastUrl) : import("../env").then((m) => m.config.broadcastUrl));
 
   // One call at a time: each owns the Ledger and `say` until it finishes.
   let queue: Promise<unknown> = Promise.resolve();
@@ -609,7 +739,8 @@ export function ledgerBackend(device: Device, options: LedgerBackendOptions = {}
     return run;
   };
 
-  const post = async <T>(path: string, body: unknown): Promise<T> => {
+  /** A POST to the QSB service; with `token`, as the signed-in deposit address. */
+  const post = async <T>(path: string, body: unknown, token?: string): Promise<T> => {
     const json = JSON.stringify(body);
     const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(json)));
     const response = await fetcher(`${(await origin()).replace(/\/$/, "")}/v1${path}`, {
@@ -618,10 +749,15 @@ export function ledgerBackend(device: Device, options: LedgerBackendOptions = {}
         "content-type": "application/json",
         // CloudFront needs the body's hash on every POST to the QSB service.
         "x-amz-content-sha256": hex.encode(digest),
+        ...(token ? { "X-Qsb-Authorization": `Bearer ${token}` } : {}),
       },
       body: json,
     });
-    if (!response.ok) throw new Plain("Couldn't sign in to QSB. Try again in a moment.");
+    if (!response.ok) {
+      if (!token) throw new Plain("Couldn't sign in to QSB. Try again in a moment.");
+      const answer = (await response.json().catch(() => ({}))) as { code?: string; error?: string; message?: string };
+      throw new ApiRequestError(answer.message ?? answer.error ?? `QSB answered ${response.status}.`, response.status, answer.code);
+    }
     return (await response.json()) as T;
   };
 
@@ -794,13 +930,78 @@ export function ledgerBackend(device: Device, options: LedgerBackendOptions = {}
   const byValue = <T extends { value: string }>(utxos: T[]) =>
     [...utxos].sort((a, b) => (BigInt(b.value) > BigInt(a.value) ? 1 : BigInt(b.value) < BigInt(a.value) ? -1 : 0));
 
+  /**
+   * This address's signed refund, if its inputs are all still at the deposit address; one whose
+   * inputs left (confirmed, or spent otherwise) is dropped.
+   */
+  const liveRefund = (address: string, utxos: Outpoint[]): SignedRefund | undefined => {
+    const refund = refunds.get(address);
+    if (!refund) return undefined;
+    const unspent = new Set(utxos.map(pointKey));
+    if (refund.inputs.every((i) => unspent.has(pointKey(i)))) return refund;
+    refunds.delete(address);
+    return undefined;
+  };
+
+  /** The deposit address's outputs, less those a refund already sent spends: they're on their way out. */
+  const notRefunded = <T extends Outpoint>(utxos: T[], refund?: SignedRefund) => {
+    if (!refund?.broadcast) return utxos;
+    const sent = new Set(refund.inputs.map(pointKey));
+    return utxos.filter((u) => !sent.has(pointKey(u)));
+  };
+
+  /** The deposit address's previous transaction for `utxo`, from the service, checked against it. */
+  const previousTx = async (c: Current, depositScript: Uint8Array, utxo: Outpoint & { value: string }) => {
+    const ask = async () =>
+      post<{ previousTxHex: string }>("/payment-input", { txid: utxo.txid, vout: utxo.vout, value: utxo.value }, await credentials(c.v, c.address).get());
+    let answer: { previousTxHex: string };
+    try {
+      answer = await ask();
+    } catch (error) {
+      if (!(error instanceof ApiRequestError && error.status === 401)) throw error;
+      sessions.delete(c.address);
+      answer = await ask();
+    }
+    const raw = hex.decode(answer.previousTxHex);
+    const prev = Transaction.fromRaw(raw, { allowUnknownInputs: true, allowUnknownOutputs: true, disableScriptCheck: true });
+    const out = utxo.vout < prev.outputsLength ? prev.getOutput(utxo.vout) : undefined;
+    if (prev.id !== utxo.txid.toLowerCase() || !out?.script || out.amount !== BigInt(utxo.value) || hex.encode(out.script) !== hex.encode(depositScript))
+      throw new Error(`QSB's previous transaction for ${utxo.txid}:${utxo.vout} doesn't match it.`);
+    return { raw, amount: out.amount };
+  };
+
+  /** POSTs the raw refund to the broadcast URL; the answer must be its txid. */
+  const broadcast = async (refund: SignedRefund) => {
+    const resend = "Nothing new needs approving: try again and the same transaction is resent.";
+    let response: Response;
+    try {
+      response = await fetcher(await broadcastUrl(), { method: "POST", headers: { "content-type": "text/plain" }, body: refund.hex });
+    } catch (cause) {
+      throw new Plain(`Couldn't reach the Bitcoin network to send it back. Check your connection. ${resend}`, { cause });
+    }
+    const text = (await response.text().catch(() => "")).trim();
+    if (!response.ok) {
+      // Sent before (this page lost the answer): it's out there already.
+      if (/already in (block ?chain|mempool)|txn-already-(known|in-mempool)/i.test(text)) return;
+      throw new Plain(`The Bitcoin network didn't take it${text ? ` (${text.slice(0, 160)})` : ""}. ${resend}`, {
+        cause: new Error(`Broadcast answered ${response.status}: ${text}`),
+      });
+    }
+    if (text.toLowerCase() !== refund.txid)
+      throw new Plain(`The broadcast answered with a different transaction than the one you approved. ${resend}`, {
+        cause: new Error(`Broadcast answered ${text}, expected ${refund.txid}.`),
+      });
+  };
+
   return {
     snapshot: (s) =>
       serial(s, "Couldn't read your vault. Try again in a moment.", async (): Promise<Snapshot> => {
         const c = await discover();
         if (!c) return { vault: null };
         // Both may need a sign-in: they share one (see credentials).
-        const [utxos, vault] = await Promise.all([withClient(c, (q) => q.utxos()), serviceVault(c)]);
+        const [allUtxos, vault] = await Promise.all([withClient(c, (q) => q.utxos()), serviceVault(c)]);
+        const refund = liveRefund(c.address, allUtxos);
+        const utxos = notRefunded(allUtxos, refund);
         const waitingSats = utxos.reduce((sum, u) => sum + BigInt(u.value), 0n);
         const sweepable = byValue(utxos).slice(0, MAX_SWEEP_INPUTS);
         const sweepableSats = sweepable.reduce((sum, u) => sum + BigInt(u.value), 0n);
@@ -819,7 +1020,7 @@ export function ledgerBackend(device: Device, options: LedgerBackendOptions = {}
         const current = c.serviceVault ?? null;
         const funded = !!current && current.status !== "unfunded";
         const job = funded ? await newestJob(c, current.id) : undefined;
-        const needRates = !funded || job?.status === "awaiting_authorization";
+        const needRates = !funded || job?.status === "awaiting_authorization" || utxos.length > 0;
         const rates = needRates ? await withClient(c, (q) => q.rates()) : undefined;
         const minimumSats =
           !funded && rates ? minimumDeposit(current ? current.scriptHex.length / 2 : SCRIPT_LEN, minerRate(rates), sweepable.length) : undefined;
@@ -847,6 +1048,13 @@ export function ledgerBackend(device: Device, options: LedgerBackendOptions = {}
         const withdrawn = (job?.status === "submitted" || job?.status === "confirmed") && job.txid;
         // After the deposit confirmed, anything at the deposit address arrived later or didn't fit the sweep.
         const leftoverSats = current && (current.status === "confirmed" || current.status === "spent") && waitingSats > 0n ? waitingSats : undefined;
+        // While a deposit is pending, nothing is refundable: a refund would spend its inputs.
+        const refundable =
+          step === "depositing" || !rates
+            ? []
+            : refundableUtxos(utxos, [...(waiting ? spentBy(waiting.rawTxHex) : []), ...(job?.manifest.helper ? [job.manifest.helper] : [])]);
+        const refundQuoted = refundable.length ? refundQuote(refundable.map((u) => BigInt(u.value)), LONGEST_REFUND_SCRIPT, minerRate(rates!)) : undefined;
+        const refundableSats = refundQuoted && refundQuoted.amount >= DUST ? refundQuoted.total : undefined;
         const view: VaultView = {
           v: c.v,
           fingerprint: c.fingerprint,
@@ -861,6 +1069,8 @@ export function ledgerBackend(device: Device, options: LedgerBackendOptions = {}
           ...(canResume !== undefined ? { canResume } : {}),
           ...(step === "ready-to-approve" && fromElsewhere ? { fromElsewhere: true } : {}),
           ...(leftoverSats !== undefined ? { leftoverSats } : {}),
+          ...(refundableSats !== undefined ? { refundableSats } : {}),
+          ...(refund?.broadcast ? { refundTxid: refund.txid } : {}),
           ...(job ? { reference: job.id } : current ? { reference: current.id } : {}),
         };
         return { vault: view };
@@ -905,7 +1115,8 @@ export function ledgerBackend(device: Device, options: LedgerBackendOptions = {}
           return;
         }
         if (vault.status !== "unfunded" || vault.funding) throw new Plain("This vault already has its deposit.");
-        const utxos = byValue(await withClient(c, (q) => q.utxos())).slice(0, MAX_SWEEP_INPUTS);
+        const all = await withClient(c, (q) => q.utxos());
+        const utxos = byValue(notRefunded(all, liveRefund(c.address, all))).slice(0, MAX_SWEEP_INPUTS);
         if (!utxos.length) throw new Plain("There's no confirmed bitcoin at the deposit address yet.");
         const rate = minerRate(await c.client.rates());
         const quote = sweepQuote(
@@ -999,6 +1210,54 @@ export function ledgerBackend(device: Device, options: LedgerBackendOptions = {}
         // "submitted" means the miner acknowledged it, "uncertain" that it may not have it: the
         // snapshot shows which until QSB's own checks say more.
         observed.set(job.id, { at: now(), status: sent.status });
+      }),
+
+    refund: (destination, s) =>
+      serial(s, "It wasn't sent back. Try again in a moment.", async () => {
+        const to = destination.trim();
+        const c = await needCurrent();
+        const publicKey = hex.decode(c.signer.publicKey);
+        const depositScript = p2wpkh(publicKey, NETWORK).script;
+        const vault = await serviceVault(c);
+        const script = refundScript(to, { depositScript, vaultScript: vault ? hex.decode(vault.scriptHex) : undefined });
+        const all = await withClient(c, (q) => q.utxos());
+        let refund = liveRefund(c.address, all);
+        if (refund?.broadcast) throw new Plain("It was already sent back. Wait for it to confirm.");
+        if (refund && refund.destination !== to)
+          throw new Plain(`You already approved sending it back to ${refund.destination}. Send it there: the same transaction is resent.`);
+        if (!refund) {
+          if (vault && (vault.status === "submitted" || (vault.status === "unfunded" && (await pending.get(vault.id)))))
+            throw new Plain("Your deposit is on its way, so nothing can be sent back now. Wait for it to confirm.");
+          const job = vault && vault.status !== "unfunded" ? await newestJob(c, vault.id) : undefined;
+          const waiting = vault ? await pending.get(vault.id) : undefined;
+          const inputs = refundableUtxos(all, [...(waiting ? spentBy(waiting.rawTxHex) : []), ...(job?.manifest.helper ? [job.manifest.helper] : [])]);
+          if (!inputs.length) throw new Plain("There's no confirmed bitcoin at the deposit address to send back.");
+          const quote = refundQuote(
+            inputs.map((u) => BigInt(u.value)),
+            script.length,
+            minerRate(await withClient(c, (q) => q.rates())),
+          );
+          if (quote.amount < DUST) throw new Plain("There's too little at the deposit address to pay the network fee and send it back.");
+          const previous: { raw: Uint8Array; amount: bigint }[] = [];
+          for (const u of inputs) previous.push(await previousTx(c, depositScript, u));
+          const tx = new Transaction({ version: 2, lockTime: 0 });
+          inputs.forEach((u, i) =>
+            tx.addInput({ txid: u.txid, index: u.vout, sequence: 0xfffffffd, witnessUtxo: { script: depositScript, amount: previous[i].amount } }),
+          );
+          tx.addOutput({ script, amount: quote.amount });
+          const signatures = await device.use(HINT.refund, s, (app) => app.signRefund(c.v, tx.unsignedTx, previous.map((p) => p.raw)));
+          verifyRefund(tx, publicKey, signatures);
+          signatures.forEach((signature, i) => {
+            tx.updateInput(i, { partialSig: [[publicKey, signature]] });
+            tx.finalizeIdx(i);
+          });
+          refund = { txid: tx.id, hex: hex.encode(tx.extract()), destination: to, inputs: inputs.map(({ txid, vout }) => ({ txid, vout })), amount: quote.amount.toString(), broadcast: false };
+          // Kept before broadcasting, so a retry resends these bytes instead of asking the Ledger again.
+          refunds.set(c.address, refund);
+        }
+        await broadcast(refund);
+        refunds.set(c.address, { ...refund, broadcast: true });
+        return { txid: refund.txid };
       }),
   };
 }

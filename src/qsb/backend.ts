@@ -70,6 +70,14 @@ export type VaultView = {
    * beyond what one sweep takes). Not in the vault, and this page can't move them yet.
    */
   leftoverSats?: bigint;
+  /**
+   * Confirmed sats at the deposit address that can be sent back now with `refund`: everything there
+   * (at most the 8 largest outputs) unless a deposit is pending, which keeps its inputs. Set only when
+   * a refund would leave more than dust after its fee; absent otherwise.
+   */
+  refundableSats?: bigint;
+  /** The last refund this page sent, until the deposit address no longer holds its inputs. */
+  refundTxid?: string;
   /** An identifier to give QSB's operator (the withdrawal's, else the vault's). */
   reference?: string;
 };
@@ -97,6 +105,12 @@ export interface Backend {
   resumeWithdrawal(say: Say): Promise<void>;
   /** Once the search is done: approve on the Ledger, then send. */
   finishWithdrawal(say: Say): Promise<void>;
+  /**
+   * Sends everything refundable at the deposit address (see `refundableSats`), minus the network
+   * fee, to `destination`, after the user approves it on the Ledger. The bitcoin never enters the
+   * vault. Returns the refund's txid once it's broadcast.
+   */
+  refund(destination: string, say: Say): Promise<{ txid: string }>;
 }
 
 export const SATS = 100_000_000n;

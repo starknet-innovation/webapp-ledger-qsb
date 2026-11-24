@@ -1,7 +1,7 @@
 // A simulated Ledger and QSB service (add ?demo to the address). No device, no network, no bitcoin.
 // Other screens: ?demo=fail (the withdrawal needs the operator), ?demo=pause (the search pauses),
 // ?demo=fees (fees rose before approval), ?demo=uncertain (the send is being checked),
-// ?demo=leftover (bitcoin left at the deposit address).
+// ?demo=leftover (bitcoin left at the deposit address, which can be sent back).
 import type { Device, Say } from "../ledger/device";
 import type { Backend, Snapshot, VaultView } from "./backend";
 
@@ -9,6 +9,7 @@ const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const ADDRESS = "bc1qdemo0000000000000000000000000000000demo";
 const DEPOSIT_TXID = "d".repeat(64);
 const WITHDRAW_TXID = "e".repeat(64);
+const REFUND_TXID = "b".repeat(64);
 const FEE = 420n;
 
 let installed = false;
@@ -90,7 +91,7 @@ export function demoBackend(): Backend {
       const created: VaultView = { v, fingerprint: fingerprintFor(v), step: "awaiting-bitcoin", depositAddress: ADDRESS, waitingSats: 0n, minimumSats: 41_000n };
       state.vault = created;
       // Someone sends bitcoin to the deposit address and it confirms.
-      later(5000, created, { step: "ready-to-deposit", waitingSats: 250_000n, minimumSats: undefined });
+      later(5000, created, { step: "ready-to-deposit", waitingSats: 250_000n, minimumSats: undefined, refundableSats: 250_000n });
     },
     async showDepositAddress(say) {
       await approve(say, "Compare the address on your Ledger with the one on this page.");
@@ -98,8 +99,12 @@ export function demoBackend(): Backend {
     async deposit(say) {
       const current = vault();
       await approve(say, `On your Ledger, check the amount and approve the deposit.`);
-      Object.assign(current, { step: "depositing", vaultSats: current.waitingSats - FEE, waitingSats: 0n, txid: DEPOSIT_TXID });
-      later(6000, current, variant === "leftover" ? { step: "in-vault", waitingSats: 12_000n, leftoverSats: 12_000n } : { step: "in-vault" });
+      Object.assign(current, { step: "depositing", vaultSats: current.waitingSats - FEE, waitingSats: 0n, refundableSats: undefined, refundTxid: undefined, txid: DEPOSIT_TXID });
+      later(
+        6000,
+        current,
+        variant === "leftover" ? { step: "in-vault", waitingSats: 12_000n, leftoverSats: 12_000n, refundableSats: 12_000n } : { step: "in-vault" },
+      );
     },
     async withdraw(destination) {
       const current = vault();
@@ -133,6 +138,21 @@ export function demoBackend(): Backend {
       Object.assign(current, { step: variant === "uncertain" ? "checking-send" : "sending", txid: WITHDRAW_TXID });
       if (variant === "uncertain") later(6000, current, { step: "sending" });
       setTimeout(() => state.vault === current && current.step === "sending" && Object.assign(current, { step: "sent" }), variant === "uncertain" ? 14000 : 8000);
+    },
+    async refund(destination, say) {
+      const current = vault();
+      if (current.step === "depositing" || !current.refundableSats) throw new Error("There's nothing to send back right now.");
+      if (destination.trim() === current.depositAddress) throw new Error("That's this vault's own address. Send it back to another address.");
+      await approve(say, "Check the address and amount on your Ledger, then approve.");
+      // Everything at the deposit address leaves; a vault that wasn't funded waits for bitcoin again.
+      Object.assign(current, {
+        refundableSats: undefined,
+        refundTxid: REFUND_TXID,
+        waitingSats: 0n,
+        leftoverSats: undefined,
+        ...(current.step === "ready-to-deposit" || current.step === "awaiting-bitcoin" ? { step: "awaiting-bitcoin", minimumSats: 41_000n, detail: undefined } : {}),
+      });
+      return { txid: REFUND_TXID };
     },
   };
 }

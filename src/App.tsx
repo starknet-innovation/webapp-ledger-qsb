@@ -282,18 +282,98 @@ function VaultStepScreen(props: {
   act: (work: (say: Say) => Promise<void>) => Promise<void>;
   feedback: ReactNode;
 }) {
-  const { vault } = props;
+  const { vault, backend, busy, act, feedback } = props;
+  const [refunding, setRefunding] = useState(false);
+  // Never while a deposit is on its way: sending its inputs back would cancel it.
+  const refundable = vault.step !== "depositing" && vault.refundableSats !== undefined ? vault.refundableSats : undefined;
+  if (refunding && refundable !== undefined)
+    return (
+      <Refund
+        sats={refundable}
+        busy={busy}
+        onCancel={() => setRefunding(false)}
+        onSubmit={(destination) =>
+          act(async (say) => {
+            await backend.refund(destination, say);
+            setRefunding(false);
+          })
+        }
+      >
+        {feedback}
+      </Refund>
+    );
+  const leftover = vault.leftoverSats !== undefined && vault.leftoverSats > 0n;
+  const offer = refundable !== undefined && (
+    <button className="secondary" disabled={busy} onClick={() => setRefunding(true)}>
+      Send it back to another address
+    </button>
+  );
   // Bitcoin that reached the deposit address after the deposit, or didn't fit in it, isn't in the vault.
   return (
     <>
       <StepScreen {...props} />
-      {vault.leftoverSats !== undefined && vault.leftoverSats > 0n && (
-        <p className="note">
-          {btc(vault.leftoverSats)} is still at your deposit address. It isn't in your vault, and this page can't move it
-          yet.
-        </p>
+      {leftover ? (
+        <div className="aside">
+          <p className="note">{btc(vault.leftoverSats!)} is still at your deposit address. It isn't in your vault.</p>
+          {offer}
+        </div>
+      ) : (
+        offer && <div className="aside">{offer}</div>
+      )}
+      {vault.refundTxid && (
+        <div className="aside">
+          <p className="note">
+            Sent back.{" "}
+            <a href={`https://mempool.space/tx/${vault.refundTxid}`} target="_blank" rel="noreferrer">
+              View the transaction
+            </a>
+          </p>
+        </div>
       )}
     </>
+  );
+}
+
+function Refund(props: { sats: bigint; busy: boolean; onSubmit: (destination: string) => void; onCancel: () => void; children: ReactNode }) {
+  const [destination, setDestination] = useState("");
+  const [problem, setProblem] = useState("");
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    const address = bitcoinAddress(destination.trim());
+    if (!address) return setProblem("That doesn't look like a Bitcoin address. It should start with bc1, 1 or 3.");
+    setProblem("");
+    props.onSubmit(address);
+  };
+  return (
+    <form onSubmit={submit} noValidate>
+      <h1>Send it back</h1>
+      <p>
+        {btc(props.sats)} is at your deposit address. It will be sent, minus a small network fee, to the
+        address you enter.
+      </p>
+      <label htmlFor="refund-destination">Send to this Bitcoin address</label>
+      <input
+        id="refund-destination"
+        autoComplete="off"
+        autoCapitalize="off"
+        spellCheck={false}
+        placeholder="bc1…"
+        value={destination}
+        onChange={(e) => setDestination(e.target.value)}
+        disabled={props.busy}
+        aria-invalid={problem ? true : undefined}
+        autoFocus
+      />
+      {problem && <p className="error">{problem}</p>}
+      <button className="primary" disabled={props.busy}>
+        {props.busy ? "Waiting for your Ledger…" : "Send it back"}
+      </button>
+      {props.children}
+      <p className="small">Your Ledger will show the address and the exact amount. The bitcoin won't go into your vault.</p>
+      <button type="button" className="link" disabled={props.busy} onClick={props.onCancel}>
+        Cancel
+      </button>
+    </form>
   );
 }
 

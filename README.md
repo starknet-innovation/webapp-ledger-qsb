@@ -164,8 +164,14 @@ Other safeguards, from an independent review of this flow:
 - **Pauses and failures:** a paused search can be continued when the user may continue it, and
   otherwise points to the QSB operator, as does a failed one.
 
-Not handled yet: bitcoin left at the deposit address after the deposit (the page shows it but can't
-move it; the Ledger app has a refund command for this), and approvals on the touch Ledgers in tests.
+- **Refund:** bitcoin at a vault's deposit address that isn't going into the vault (left over after
+  the deposit, sent late, or the user changed their mind before depositing) can be sent to another
+  address. The Ledger signs it with the refund kind of SIGN_DEPOSIT and shows the address and amount.
+  The QSB service relays vault deposits only, so a refund is broadcast through mempool.space's public
+  API (`VITE_BROADCAST_URL` to change it). No refund is offered while a deposit is pending, because it
+  would spend that deposit's inputs.
+
+Not handled yet: approvals on the touch Ledgers in tests.
 
 Also open:
 

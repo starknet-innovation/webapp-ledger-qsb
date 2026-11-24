@@ -16,7 +16,7 @@ concurrency:
 
 env:
   # The qsb-app commit the SDK is built from. Bump it deliberately.
-  QSB_APP_REF: 5a1d71209c6fce1c491110d2296994cbfd633c99
+  QSB_APP_REF: 29fd8686c45d7e7d4286221c2bb311e52f81e327
 
 jobs:
   build:

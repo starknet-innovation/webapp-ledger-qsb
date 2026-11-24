@@ -14,7 +14,7 @@ import { DeviceManagementKitBuilder, DeviceModelId, type DeviceManagementKit } f
 import { speculosIdentifier, speculosTransportFactory } from "@ledgerhq/device-transport-kit-speculos";
 import { firstValueFrom, timeout } from "rxjs";
 import { Verifier } from "bip322-js";
-import { PqbStatusError } from "../src/ledger/pqbApp.ts";
+import { PqbStatusError } from "../src/vendor/pqb-ledger/app.ts";
 import { Plain, openSession, type Device } from "../src/ledger/session.ts";
 
 const url = process.env.SPECULOS_URL;

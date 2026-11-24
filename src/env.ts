@@ -17,6 +17,11 @@ export const config = {
   install: (import.meta.env.VITE_LEDGER_INSTALL || (import.meta.env.VITE_LEDGER_PROVIDER ? "catalog" : "sideload")) as
     | "catalog"
     | "sideload",
+  /**
+   * The real vault flow (create, deposit, withdraw) with a Ledger. Off unless VITE_VAULT_FLOW=on:
+   * until a one-input PQB withdrawal has been solved and spent on mainnet, a deposit may not come back.
+   */
+  vaultFlow: import.meta.env.VITE_VAULT_FLOW === "on",
   /** Origin of the QSB service; defaults to the page's own origin. */
   api: import.meta.env.VITE_QSB_API || location.origin,
 };

@@ -1,6 +1,6 @@
 node_modules
 dist
-vendor
+/vendor
 .env.local
 public/firmware
 build

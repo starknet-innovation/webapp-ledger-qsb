@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { config } from "./env";
 import { connectLedger, ledgerSupported, type Device } from "./ledger/device";
-import type { AppStatus } from "./ledger/pqbApp";
-import { btc, parseBtc, type Backend, type Snapshot } from "./qsb/backend";
+import type { AppStatus } from "./ledger/session";
+import { btc, type Backend, type Snapshot, type VaultView } from "./qsb/backend";
 import { demoBackend, demoDevice } from "./qsb/demo";
+
+// The real backend, loaded only when the vault flow is on, so the demo bundle doesn't carry it.
+// A glob rather than import(): the app still builds while the file doesn't exist.
+const ledgerBackendModule = import.meta.glob<typeof import("./qsb/ledgerBackend")>("./qsb/ledgerBackend.ts");
 
 type Step = "connect" | "install" | "vault";
 const STEPS: { id: Step; label: string }[] = [
@@ -61,13 +65,19 @@ export function App() {
 
   const openVault = async (d: Device, say: (hint: string) => void) => {
     if (!(await d.openApp(say))) return setStep("install");
-    // Only the demo has a working vault flow today; see "What has to exist" in the README.
     if (config.demo) setBackend(demoBackend());
     else {
       const current = await d.status();
       setStatus(current);
       // An app from before sign-in reports the same version; replace it.
       if (!current.signIn) return setStep("install");
+      // The real vault flow stays off until VITE_VAULT_FLOW=on; see `vaultFlow` in env.ts.
+      if (config.vaultFlow) {
+        const load = ledgerBackendModule["./qsb/ledgerBackend.ts"];
+        if (!load) throw new Error("This build can't open vaults yet.");
+        const { ledgerBackend } = await load();
+        setBackend(ledgerBackend(d));
+      }
     }
     setStep("vault");
   };
@@ -184,39 +194,52 @@ export function App() {
   );
 }
 
+type Say = (hint: string) => void;
+
 function Vault({ backend }: { backend: Backend }) {
   const [snap, setSnap] = useState<Snapshot>();
   const [loadError, setLoadError] = useState("");
-  const [fresh, setFresh] = useState(false); // after a finished withdrawal: start over with a new deposit
+  const [loadHint, setLoadHint] = useState("");
   const action = useAction();
-  const busy = useRef(false);
-  busy.current = action.busy;
+  // No polling while an action or another read is running: both may need the Ledger.
+  const working = useRef(false);
+  const reading = useRef(false);
 
   const refresh = useCallback(async () => {
+    if (reading.current) return;
+    reading.current = true;
     try {
-      setSnap(await backend.snapshot());
+      setSnap(await backend.snapshot(setLoadHint));
       setLoadError("");
     } catch (e) {
       setLoadError(message(e));
+    } finally {
+      reading.current = false;
+      setLoadHint("");
     }
   }, [backend]);
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => !busy.current && void refresh(), config.demo ? 2000 : 20000);
+    const timer = setInterval(() => !working.current && void refresh(), config.demo ? 2000 : 20000);
     return () => clearInterval(timer);
   }, [refresh]);
 
-  const act = (work: (say: (hint: string) => void) => Promise<void>) =>
+  const act = (work: (say: Say) => Promise<void>) =>
     action.run(async (say) => {
-      await work(say);
+      working.current = true;
+      try {
+        await work(say);
+      } finally {
+        working.current = false;
+      }
       await refresh();
     });
 
   if (!snap)
     return loadError ? (
       <>
-        <h1>Couldn't load your vault</h1>
+        <h1>Couldn't open your vault</h1>
         <p className="error">{loadError}</p>
         <button className="primary" onClick={refresh}>
           Try again
@@ -225,156 +248,323 @@ function Vault({ backend }: { backend: Backend }) {
     ) : (
       <>
         <h1>Opening your vault…</h1>
-        <p className="hint">
-          <span className="pulse" aria-hidden /> Approve the sign-in on your Ledger.
+        <p className="hint" role="status">
+          <span className="pulse" aria-hidden /> {loadHint || "Checking your Ledger…"}
         </p>
       </>
     );
 
-  const { vault, withdrawal } = snap;
-  const feedback = <Feedback {...action} />;
+  // A Ledger prompt from a background check, or a failed check, shows under the screen.
+  const feedback = <Feedback hint={action.hint || loadHint} error={action.error || (loadError && `Couldn't check for updates: ${loadError}`)} />;
+  const busy = action.busy;
+  const { vault } = snap;
 
-  if (!fresh && withdrawal?.state === "sent")
+  if (!vault)
     return (
       <>
-        <h1>Withdrawal sent</h1>
-        <p>Your bitcoin is on its way to:</p>
-        <Mono>{withdrawal.destination}</Mono>
-        {withdrawal.txid && <TxLink txid={withdrawal.txid} />}
-        <button className="primary" onClick={() => setFresh(true)}>
-          Make a new deposit
-        </button>
-      </>
-    );
-
-  if (!fresh && withdrawal?.state === "ready")
-    return (
-      <>
-        <h1>Your withdrawal is ready</h1>
-        <p>Approve it on your Ledger to send your bitcoin to:</p>
-        <Mono>{withdrawal.destination}</Mono>
-        <button className="primary" disabled={action.busy} onClick={() => act((say) => backend.finishWithdrawal(say))}>
-          {action.busy ? "Waiting for your Ledger…" : "Approve on Ledger"}
+        <h1>Create your vault</h1>
+        <p>Your vault keeps your bitcoin safe, even from future quantum computers. Only your Ledger can open it.</p>
+        <button className="primary" disabled={busy} onClick={() => act((say) => backend.createVault(say))}>
+          {busy ? "Waiting for your Ledger…" : "Create my vault"}
         </button>
         {feedback}
+        <p className="small">Your Ledger will ask you to approve three times.</p>
       </>
     );
 
-  if (!fresh && withdrawal?.state === "searching")
-    return (
-      <>
-        <h1>Your withdrawal is being prepared</h1>
-        <p>
-          This takes several hours. You can close this page. Come back with your Ledger to approve the last step.
+  return <VaultStepScreen vault={vault} backend={backend} busy={busy} act={act} feedback={feedback} />;
+}
+
+function VaultStepScreen(props: {
+  vault: VaultView;
+  backend: Backend;
+  busy: boolean;
+  act: (work: (say: Say) => Promise<void>) => Promise<void>;
+  feedback: ReactNode;
+}) {
+  const { vault } = props;
+  // Bitcoin that reached the deposit address after the deposit, or didn't fit in it, isn't in the vault.
+  return (
+    <>
+      <StepScreen {...props} />
+      {vault.leftoverSats !== undefined && vault.leftoverSats > 0n && (
+        <p className="note">
+          {btc(vault.leftoverSats)} is still at your deposit address. It isn't in your vault, and this page can't move it
+          yet.
         </p>
-        <p>Going to:</p>
-        <Mono>{withdrawal.destination}</Mono>
-        <p className="small">This page checks by itself.</p>
-      </>
-    );
-
-  if (!fresh && vault && vault.status === "submitted")
-    return (
-      <>
-        <h1>Your deposit is on its way</h1>
-        <p className="amount">{btc(vault.sats)}</p>
-        <p>Waiting for the Bitcoin network to confirm it, usually within an hour. You can close this page.</p>
-        <TxLink txid={vault.txid} />
-      </>
-    );
-
-  if (!fresh && vault && vault.status === "confirmed")
-    return (
-      <Withdraw
-        sats={vault.sats}
-        failed={withdrawal?.state === "failed" ? withdrawal.detail || "The last withdrawal didn't finish." : ""}
-        busy={action.busy}
-        onSubmit={(destination) => act((say) => backend.withdraw(destination, say))}
-      >
-        {feedback}
-      </Withdraw>
-    );
-
-  if (snap.walletSats === 0n)
-    return (
-      <>
-        <h1>First, send bitcoin to your Ledger</h1>
-        <p>Send the amount you want to protect, plus a little for network fees, to this address:</p>
-        <Mono copy>{snap.address}</Mono>
-        <button className="secondary" disabled={action.busy} onClick={() => act(() => backend.showAddress())}>
-          {action.busy ? "Compare it with your Ledger's screen…" : "Check this address on my Ledger"}
-        </button>
-        {feedback}
-        <p className="small">This page updates by itself once the bitcoin is confirmed.</p>
-      </>
-    );
-
-  return (
-    <Deposit
-      available={snap.walletSats}
-      busy={action.busy}
-      onSubmit={(sats) =>
-        act(async (say) => {
-          await backend.deposit(sats, say);
-          setFresh(false);
-        })
-      }
-    >
-      {feedback}
-    </Deposit>
+      )}
+    </>
   );
 }
 
-function Deposit(props: { available: bigint; busy: boolean; onSubmit: (sats: bigint) => void; children: ReactNode }) {
-  const [amount, setAmount] = useState("");
-  const [problem, setProblem] = useState("");
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    const sats = parseBtc(amount);
-    if (!sats) return setProblem("Enter an amount in BTC, like 0.001.");
-    if (sats >= props.available) return setProblem(`You have ${btc(props.available)}. Leave a little for the network fee.`);
-    setProblem("");
-    props.onSubmit(sats);
-  };
-  return (
-    <form onSubmit={submit}>
-      <h1>Deposit into your vault</h1>
-      <label htmlFor="amount">Amount in BTC</label>
-      <input id="amount" inputMode="decimal" autoComplete="off" placeholder="0.001" value={amount} onChange={(e) => setAmount(e.target.value)} disabled={props.busy} autoFocus />
-      <p className="small">You have {btc(props.available)} on your Ledger's QSB address.</p>
-      {problem && <p className="error">{problem}</p>}
-      <button className="primary" disabled={props.busy}>
-        {props.busy ? "Waiting for your Ledger…" : "Deposit"}
-      </button>
-      {props.children}
-      <p className="small">A vault takes one deposit. You'll confirm the amount on your Ledger.</p>
-    </form>
-  );
+function StepScreen(props: {
+  vault: VaultView;
+  backend: Backend;
+  busy: boolean;
+  act: (work: (say: Say) => Promise<void>) => Promise<void>;
+  feedback: ReactNode;
+}) {
+  const { vault, backend, busy, act, feedback } = props;
+  const amount = vault.vaultSats ?? vault.waitingSats;
+  const reference = vault.reference && <p className="small meta">Reference: {vault.reference}</p>;
+  switch (vault.step) {
+    case "awaiting-bitcoin":
+      return (
+        <>
+          <h1>Send bitcoin to your vault's deposit address</h1>
+          <p>
+            Send the amount you want to protect, from any wallet, to this address
+            {vault.minimumSats !== undefined ? <> (at least {btc(vault.minimumSats)})</> : null}:
+          </p>
+          <Mono copy>{vault.depositAddress}</Mono>
+          {vault.detail && vault.waitingSats > 0n && (
+            <p className="error">
+              {btc(vault.waitingSats)} has arrived. {vault.detail}
+            </p>
+          )}
+          <button className="secondary" disabled={busy} onClick={() => act((say) => backend.showDepositAddress(say))}>
+            {busy ? "Compare it with your Ledger's screen…" : "Check this address on my Ledger"}
+          </button>
+          {feedback}
+          <p className="small">This page updates by itself once the bitcoin is confirmed.</p>
+          <p className="small meta">
+            Vault #{vault.v} · fingerprint {vault.fingerprint}
+          </p>
+        </>
+      );
+
+    case "ready-to-deposit":
+      return (
+        <>
+          <h1>Your bitcoin has arrived</h1>
+          <p className="amount">{btc(vault.waitingSats)}</p>
+          <p>It's waiting at your deposit address. Move it into your vault to protect it.</p>
+          {vault.detail && <p className="error">{vault.detail}</p>}
+          <button className="primary" disabled={busy} onClick={() => act((say) => backend.deposit(say))}>
+            {busy ? "Waiting for your Ledger…" : "Move it into your vault"}
+          </button>
+          {feedback}
+          <p className="small">You'll confirm the amount on your Ledger. A vault takes one deposit.</p>
+        </>
+      );
+
+    case "depositing":
+      return (
+        <>
+          <h1>Your deposit is on its way</h1>
+          <p className="amount">{btc(amount)}</p>
+          <p>Waiting for the Bitcoin network to confirm it, usually within an hour. You can close this page.</p>
+          {vault.txid && <TxLink txid={vault.txid} />}
+          {feedback}
+          <p className="small">This page updates by itself.</p>
+        </>
+      );
+
+    case "in-vault":
+      return (
+        <Withdraw sats={vault.vaultSats} busy={busy} onSubmit={(destination) => act((say) => backend.withdraw(destination, say))}>
+          {feedback}
+        </Withdraw>
+      );
+
+    case "withdrawal-not-started":
+      return (
+        <>
+          <h1>Your withdrawal hasn't started yet</h1>
+          <p>QSB didn't receive it last time. It's set to send everything in your vault to:</p>
+          {vault.destination && <Mono>{vault.destination}</Mono>}
+          <button
+            className="primary"
+            disabled={busy || !vault.destination}
+            onClick={() => act((say) => backend.withdraw(vault.destination!, say))}
+          >
+            {busy ? "Starting…" : "Start the withdrawal"}
+          </button>
+          {feedback}
+          <p className="small">It can't be changed now: this vault is already set to this address.</p>
+        </>
+      );
+
+    case "searching":
+      return (
+        <>
+          <h1>Your withdrawal is being prepared</h1>
+          <p>This takes several hours. You can close this page. Come back with your Ledger to approve the last step.</p>
+          {vault.destination && (
+            <>
+              <p>Going to:</p>
+              <Mono>{vault.destination}</Mono>
+            </>
+          )}
+          {feedback}
+          <p className="small">This page checks by itself.</p>
+        </>
+      );
+
+    case "paused":
+      return (
+        <>
+          <h1>Your withdrawal is paused</h1>
+          <p>{vault.detail || "The search is paused. Your bitcoin is safe in the vault."}</p>
+          {vault.destination && (
+            <>
+              <p>Going to:</p>
+              <Mono>{vault.destination}</Mono>
+            </>
+          )}
+          {vault.canResume && (
+            <button className="primary" disabled={busy} onClick={() => act((say) => backend.resumeWithdrawal(say))}>
+              {busy ? "Continuing…" : "Continue the search"}
+            </button>
+          )}
+          {feedback}
+          {!vault.canResume && reference}
+          <p className="small">This page checks by itself.</p>
+        </>
+      );
+
+    case "waiting-for-fees":
+      return (
+        <>
+          <h1>Waiting for network fees to drop</h1>
+          <p>
+            Your withdrawal is ready, but network fees are higher right now than it pays. It can be sent once they drop.
+            Your bitcoin is safe in the vault.
+          </p>
+          {vault.destination && (
+            <>
+              <p>Going to:</p>
+              <Mono>{vault.destination}</Mono>
+            </>
+          )}
+          {feedback}
+          <p className="small">This page checks by itself. You'll approve on your Ledger once it can be sent.</p>
+        </>
+      );
+
+    case "ready-to-approve":
+      return (
+        <>
+          <h1>Your withdrawal is ready</h1>
+          {vault.fromElsewhere && (
+            <p className="note">This withdrawal was started from another browser. Make sure this address is yours before you approve.</p>
+          )}
+          <p>Approve it on your Ledger to send your bitcoin to:</p>
+          {vault.destination && <Mono>{vault.destination}</Mono>}
+          <button className="primary" disabled={busy} onClick={() => act((say) => backend.finishWithdrawal(say))}>
+            {busy ? "Waiting for your Ledger…" : "Approve on Ledger"}
+          </button>
+          {feedback}
+          <p className="small">Check that the address on your Ledger matches this one.</p>
+        </>
+      );
+
+    case "sending":
+      return (
+        <>
+          <h1>Your withdrawal is on its way</h1>
+          <p>It was sent. Waiting for the Bitcoin network to confirm it, usually within an hour. You can close this page.</p>
+          {vault.destination && (
+            <>
+              <p>Going to:</p>
+              <Mono>{vault.destination}</Mono>
+            </>
+          )}
+          {vault.txid && <TxLink txid={vault.txid} />}
+          {feedback}
+          <p className="small">This page updates by itself.</p>
+        </>
+      );
+
+    case "checking-send":
+      return (
+        <>
+          <h1>Checking your withdrawal</h1>
+          <p>
+            It may have been sent, but that isn't confirmed yet. QSB is checking, and this page will update by itself.
+            Nothing is needed from you now.
+          </p>
+          {vault.destination && (
+            <>
+              <p>Going to:</p>
+              <Mono>{vault.destination}</Mono>
+            </>
+          )}
+          {vault.txid && <TxLink txid={vault.txid} />}
+          {feedback}
+          {reference}
+        </>
+      );
+
+    case "sent":
+      return (
+        <>
+          <h1>Withdrawal complete</h1>
+          <p>Your bitcoin was sent to:</p>
+          {vault.destination && <Mono>{vault.destination}</Mono>}
+          {vault.txid && <TxLink txid={vault.txid} />}
+          <p>This vault is finished. To protect more bitcoin, create a new one.</p>
+          <button className="primary" disabled={busy} onClick={() => act((say) => backend.createVault(say))}>
+            {busy ? "Waiting for your Ledger…" : "Create a new vault"}
+          </button>
+          {feedback}
+          <p className="small">Your Ledger will ask you to approve three times.</p>
+        </>
+      );
+
+    case "failed":
+      return (
+        <>
+          <h1>Your vault needs help from QSB</h1>
+          <p className="error">{vault.detail || "Something stopped this vault. Your bitcoin is still in it."}</p>
+          {vault.vaultSats !== undefined && <p>{btc(vault.vaultSats)} is in your vault.</p>}
+          {feedback}
+          {reference}
+        </>
+      );
+  }
 }
 
-function Withdraw(props: { sats: bigint; failed: string; busy: boolean; onSubmit: (destination: string) => void; children: ReactNode }) {
+/** A Bitcoin mainnet address, roughly: bech32 (bc1…) or legacy (1… / 3…). Bech32 may be all caps. */
+const bitcoinAddress = (input: string) => {
+  const address = /^BC1[A-Z0-9]+$/.test(input) ? input.toLowerCase() : input;
+  return /^(bc1[02-9ac-hj-np-z]{11,87}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$/.test(address) ? address : undefined;
+};
+
+function Withdraw(props: { sats?: bigint; busy: boolean; onSubmit: (destination: string) => void; children: ReactNode }) {
   const [destination, setDestination] = useState("");
   const [problem, setProblem] = useState("");
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const address = destination.trim();
-    if (!/^(bc1[a-z0-9]{20,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$/.test(address))
-      return setProblem("That doesn't look like a Bitcoin address.");
+    const address = bitcoinAddress(destination.trim());
+    if (!address) return setProblem("That doesn't look like a Bitcoin address. It should start with bc1, 1 or 3.");
     setProblem("");
     props.onSubmit(address);
   };
   return (
-    <form onSubmit={submit}>
-      <h1>{btc(props.sats)} is in your vault</h1>
-      {props.failed && <p className="error">{props.failed}</p>}
+    <form onSubmit={submit} noValidate>
+      <h1>{props.sats !== undefined ? `${btc(props.sats)} is in your vault` : "Your bitcoin is in your vault"}</h1>
       <label htmlFor="destination">Withdraw everything to this Bitcoin address</label>
-      <input id="destination" autoComplete="off" spellCheck={false} placeholder="bc1…" value={destination} onChange={(e) => setDestination(e.target.value)} disabled={props.busy} />
+      <input
+        id="destination"
+        autoComplete="off"
+        autoCapitalize="off"
+        spellCheck={false}
+        placeholder="bc1…"
+        value={destination}
+        onChange={(e) => setDestination(e.target.value)}
+        disabled={props.busy}
+        aria-invalid={problem ? true : undefined}
+      />
       {problem && <p className="error">{problem}</p>}
       <button className="primary" disabled={props.busy}>
         {props.busy ? "Starting…" : "Withdraw"}
       </button>
       {props.children}
-      <p className="small">A withdrawal empties the vault and takes several hours. You'll approve it on your Ledger at the end.</p>
+      <p className="small">
+        A withdrawal empties the vault and takes several hours. Check the address: it can't be changed once started.
+        You'll approve it on your Ledger at the end.
+      </p>
     </form>
   );
 }

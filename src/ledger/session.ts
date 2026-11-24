@@ -1,5 +1,5 @@
 // One connected Ledger, whatever the transport: WebHID in the browser, Speculos in tests.
-// Imports only npm packages and sibling modules (with their .ts extension), so Node can run it.
+// Imports no browser-only module, so Node can run it (tests load it with tsx).
 import {
   DeviceActionStatus,
   GetOsVersionCommand,
@@ -10,11 +10,31 @@ import {
   isSuccessCommandResult,
   type DeviceManagementKit,
 } from "@ledgerhq/device-management-kit";
-import { PqbApp, PqbStatusError, SW_UNKNOWN_INS, type AppStatus } from "./pqbApp.ts";
+import { PqbApp, PqbStatusError } from "../vendor/pqb-ledger/app.ts";
 import { LoaderError, parseScript, sideload, type Send } from "./sideload.ts";
 
 /** Tells the user what to do on the device right now; "" clears it. */
 export type Say = (hint: string) => void;
+
+/** The PQB Ledger app's client (app-qsb clients/js, vendored in src/vendor/pqb-ledger). */
+export type { PqbApp };
+export { PqbStatusError };
+
+export type AppStatus = {
+  /** The app's version, e.g. "0.2.0". */
+  version: string;
+  /** The derivation profile it implements, e.g. "PQB-v1". */
+  profile: string;
+  /** Vault records this Ledger holds for its current seed. */
+  vaults: number;
+  /** The app can sign in to the QSB service (SIGN_IN, app-qsb after 0.2.0). */
+  signIn: boolean;
+};
+
+/** The app doesn't know the instruction: it predates it. */
+const SW_UNKNOWN_INS = 0x6d00;
+/** The user rejected on the device. */
+const SW_DENY = 0x6985;
 
 export interface Device {
   readonly name: string;
@@ -29,6 +49,13 @@ export interface Device {
   status(): Promise<AppStatus>;
   /** Vault `v`'s deposit address. Read-only, no approval. The app must be open. */
   depositAddress(v: number): Promise<{ address: string }>;
+  /**
+   * Runs `work` with the PQB app's client while the kit's background polling is paused, showing
+   * `hint` (what to do on the Ledger) until it finishes. A rejection on the device becomes a
+   * Plain "You declined" error, an app without the command a Plain "out of date" one; other
+   * errors pass through. The app must be open.
+   */
+  use<T>(hint: string, say: Say, work: (app: PqbApp) => Promise<T>): Promise<T>;
   /**
    * Signs the QSB service's sign-in challenge as vault `v`'s deposit address, after the user
    * approves it on the Ledger. Returns the address and the BIP-322 signature. The app must be open.
@@ -122,7 +149,35 @@ export function openSession(sdk: DeviceManagementKit, sessionId: string, options
     const r = await sdk.sendApdu({ sessionId, apdu });
     return { sw: (r.statusCode[0] << 8) | r.statusCode[1], data: r.data };
   };
-  const app = new PqbApp(send);
+  const app = new PqbApp({
+    async send(cla, ins, p1, p2, data = new Uint8Array()) {
+      const apdu = new Uint8Array(5 + data.length);
+      apdu.set([cla, ins, p1, p2, data.length]);
+      apdu.set(data, 5);
+      const { sw, data: response } = await send(apdu);
+      const out = new Uint8Array(response.length + 2);
+      out.set(response);
+      out.set([sw >> 8, sw & 0xff], response.length);
+      return out;
+    },
+  });
+
+  const use = async <T>(hint: string, say: Say, work: (app: PqbApp) => Promise<T>): Promise<T> => {
+    const resume = sdk.disableDeviceSessionRefresher({ sessionId, blockerId: "qsb-app" });
+    say(hint);
+    try {
+      return await work(app);
+    } catch (error) {
+      if (error instanceof PqbStatusError && error.statusWord === SW_UNKNOWN_INS)
+        throw new Plain("The app on your Ledger is out of date. Install it again from this page.");
+      if (error instanceof PqbStatusError && error.statusWord === SW_DENY)
+        throw new Plain("You declined on your Ledger. Try again when you're ready.");
+      throw error;
+    } finally {
+      say("");
+      resume();
+    }
+  };
 
   /** Loads the QSB build served next to this page, for apps Ledger's catalog doesn't carry. */
   const loadFromSite = async (progress: (fraction: number) => void, say: Say) => {
@@ -184,30 +239,29 @@ export function openSession(sdk: DeviceManagementKit, sessionId: string, options
     },
     async status() {
       try {
-        return await app.status();
+        const { version, profile } = await app.getVersion();
+        const state = await app.getState();
+        // A continuation with no first chunk: an app with SIGN_IN refuses it as out of order
+        // (0xB001) without showing anything; an older one doesn't know the instruction.
+        let signIn = true;
+        try {
+          await app.exchange(0x31, 0x80, Uint8Array.of(0));
+        } catch (error) {
+          if (!(error instanceof PqbStatusError)) throw error;
+          signIn = error.statusWord !== SW_UNKNOWN_INS;
+        }
+        return { version, profile, vaults: state.records, signIn };
       } catch {
         throw new Plain("The app on your Ledger is out of date. Install it again from this page.");
       }
     },
     async depositAddress(v) {
-      return { address: (await app.depositAddress(v)).address };
+      return { address: (await app.getDepositAddress(v)).address };
     },
+    use,
     async signIn(v, message, say) {
-      // The kit polls the device in the background; keep it quiet while the review is on screen.
-      const resume = sdk.disableDeviceSessionRefresher({ sessionId, blockerId: "qsb-sign-in" });
-      say("Check the details on your Ledger, then approve the sign-in.");
-      try {
-        return await app.signIn(v, message);
-      } catch (error) {
-        if (error instanceof PqbStatusError && error.statusWord === SW_UNKNOWN_INS)
-          throw new Plain("The app on your Ledger is out of date. Install it again from this page.");
-        if (error instanceof PqbStatusError && error.statusWord === 0x6985)
-          throw new Plain("You declined on your Ledger. Try again when you're ready.");
-        throw error;
-      } finally {
-        say("");
-        resume();
-      }
+      const { address, bip322 } = await use("Check the details on your Ledger, then approve the sign-in.", say, (a) => a.signIn(v, message));
+      return { address, signature: bip322 };
     },
     async disconnect() {
       await sdk.disconnect({ sessionId }).catch(() => {});

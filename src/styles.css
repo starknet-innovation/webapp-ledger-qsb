@@ -71,6 +71,9 @@ form .error { margin: 0 0 12px; }
 
 .mono { display: flex; align-items: center; gap: 12px; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin: 0 0 16px; }
 .mono code { flex: 1; font: 15px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.mono button { flex: none; }
+.meta { font-size: 13px; overflow-wrap: anywhere; }
+.secondary + .hint, .secondary + .error { margin-top: 12px; }
 
 .progress { position: relative; height: 56px; border-radius: 12px; border: 1px solid var(--line); overflow: hidden; }
 .progress div { height: 100%; background: var(--accent); opacity: 0.35; transition: width 0.2s; }

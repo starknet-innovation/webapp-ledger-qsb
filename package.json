@@ -6,7 +6,7 @@
   "scripts": {
     "sdk": "node scripts/vendor-sdk.mjs",
     "firmware": "node scripts/build-firmware.mjs",
-    "test": "node --test test/*.test.ts",
+    "test": "node --import tsx --test test/*.test.ts",
     "test:speculos": "node scripts/speculos.mjs",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
@@ -33,6 +33,7 @@
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^6.3.0",
     "bip322-js": "^4.0.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.0",
     "vite": "^8.3.8"
   },
